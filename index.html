@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Revisor de Gastos SAP</title>
+<title>Agentes IA LCA</title>
 <script>
 /* =====================================================================
    CONFIGURACIÓN — edita solo este bloque
@@ -25,8 +25,12 @@ window.CONFIG = {
 
   // Procesamiento de facturas
   DIVIDIR_PDF_POR_PAGINA: true,     // cada página se lee por separado (más rápido y confiable)
-  PROCESOS_SIMULTANEOS: 2,         // Gemini gratis permite ~15 lecturas por minuto
-  REINTENTOS_LIMITE: 4,             // reintentos automáticos cuando la IA pide esperar (límite por minuto)
+  PROCESOS_SIMULTANEOS: 3,         // las páginas se reparten entre Gemini 3.5 y 3.1 Flash-Lite (~15 por minuto cada uno)
+  REINTENTOS_LIMITE: 8,             // reintentos automáticos cuando todos los modelos están ocupados en el minuto (varios usuarios a la vez)
+  TABLA_USO_MODELOS: "uso_modelos",
+  NOMBRE_PLATAFORMA: "Agentes IA LCA",   // nombre que se ve en el login y en la barra superior
+  TABLA_SUGERENCIAS: "sugerencias", // sugerencias del equipo que la IA aplica al leer y al revisar
+  REGLAS_AUTOMATICAS: true,         // al comparar, aplicar automáticamente las sugerencias de revisión (1 consulta de IA) // contador compartido de cupos de IA (panel "Capacidad de IA hoy")
   MAX_MB_ARCHIVO: 40,
   MAX_PX_IMAGEN: 2200,
 
@@ -51,8 +55,37 @@ window.CONFIG = {
     aprobador:       ["aprobador informe de gastos", "aprobador", "approver"],
     fecha_gasto:     ["fecha de gasto", "fecha gasto", "expense date"],
     id_gasto:        ["id de gastos", "id de gasto", "id gasto", "expense id"],
-    finalidad:       ["finalidad", "purpose"]
+    finalidad:       ["finalidad", "purpose"],
+    tipo_gasto:      ["tipo de gasto", "expense type"],
+    categoria_gasto: ["categoria de gasto", "expense category"],
+    fecha_inicio:    ["fecha de inicio", "start date"],
+    fecha_fin:       ["fecha de fin", "end date"],
+    moneda_gasto:    ["moneda de gastos", "moneda de gasto", "currency"],
+    salida:          ["salida desde"],
+    llegada:         ["llegada a"]
   },
+
+  // Coherencia "Tipo de gasto" de SAP ↔ categoría del comprobante (el texto se busca sin acentos ni mayúsculas).
+  // categorias: lo que se acepta para ese tipo. regimen: límite de política que aplica (vacío = se decide por país).
+  REGLAS_TIPO_GASTO: [
+    { contiene: "atencion a clientes", categorias: ["alimentacion", "otros"], regimen: "sin_limite" },
+    { contiene: "alimentacion",        categorias: ["alimentacion"] },
+    { contiene: "hospedaje",           categorias: ["hospedaje"] },
+    { contiene: "combustible",         categorias: ["combustible"] },
+    { contiene: "peajes",              categorias: ["parqueo", "transporte"] },
+    { contiene: "parqueo",             categorias: ["parqueo", "transporte"] },
+    { contiene: "taxi",                categorias: ["transporte"] },
+    { contiene: "transporte",          categorias: ["transporte"] },
+    { contiene: "boletos",             categorias: ["transporte", "otros"] },
+    { contiene: "alquiler",            categorias: ["transporte", "otros"] },
+    { contiene: "cafeteria",           categorias: ["alimentacion", "otros"] },
+    { contiene: "suministros",         categorias: ["otros"] },
+    { contiene: "otros consumos",      categorias: ["otros", "alimentacion", "parqueo", "transporte"] }
+  ],
+  // Nombres del grupo que se aceptan como receptor de la factura en cualquier empresa
+  NOMBRES_GRUPO: ["Legrand", "Bticino"],
+  // El sufijo del tipo de gasto define el régimen de límites
+  SUFIJO_REGIMEN: { "viaticos": "viaticos", "gira": "gira", "viaje": "viaje" },
 
   POLITICA_DEFECTO: {
     general: {
@@ -62,6 +95,8 @@ window.CONFIG = {
       propina_max_pct: 10,          // propina máxima sobre el consumo
       confianza_minima: 0.75,
       tol_fecha_dias: 1,
+      tol_rango_dias: 1,            // días de margen para "Fecha de inicio/fin" de SAP
+      validar_periodo_informe: true, // comprobantes de todo el informe dentro del período de las estadías (solo advertencia)
       sufijos_propina: ["*"],       // "*" = cualquier sufijo de letras (-P, -A, -S…) cuando existe la factura base; o una lista: ["P", "A"]            // días de diferencia aceptados (advertencia) entre la factura y la "Fecha de gasto" de SAP
       desayuno_hasta: "10:59",
       almuerzo_hasta: "16:59",
@@ -90,13 +125,16 @@ window.CONFIG = {
       { region: "EEUU",                     desayuno: 40, almuerzo_cena: 150, moneda: "USD", paises: ["Estados Unidos"] },
       { region: "Europa",                   desayuno: 40, almuerzo_cena: 150, moneda: "EUR", paises: ["España", "Francia", "Italia", "Alemania", "Portugal", "Reino Unido", "Países Bajos", "Bélgica", "Suiza", "Austria", "Irlanda", "Polonia", "Grecia", "Suecia", "Dinamarca", "Noruega", "Finlandia", "República Checa"] }
     ],
-    // Unidades de cada moneda por 1 USD. VALORES DE EJEMPLO: actualízalos en la pestaña Políticas.
+    // Unidades de cada moneda por 1 USD. Tabla corporativa "TIPOS DE CAMBIO DEL 01.10.2026 AL 31.10.2026",
+    // columna "MONEDA PAIS VRS $$$ REGISTRO". EUR = 462,40 / 536,97 (colones por USD / colones por EUR).
+    // MXN, COP y CLP no vienen en la tabla corporativa: son de referencia.
     tipos_cambio: [
-      { moneda: "USD", por_usd: 1 },     { moneda: "EUR", por_usd: 0.86 }, { moneda: "CRC", por_usd: 445 },
-      { moneda: "GTQ", por_usd: 7.65 },  { moneda: "HNL", por_usd: 26.4 }, { moneda: "NIO", por_usd: 36.7 },
-      { moneda: "DOP", por_usd: 63 },    { moneda: "MXN", por_usd: 18.5 }, { moneda: "COP", por_usd: 4000 }
+      { moneda: "USD", por_usd: 1 },     { moneda: "CRC", por_usd: 462.40 }, { moneda: "EUR", por_usd: 0.8611 },
+      { moneda: "GTQ", por_usd: 7.64 },  { moneda: "HNL", por_usd: 26.88 },  { moneda: "NIO", por_usd: 36.62 },
+      { moneda: "DOP", por_usd: 59.84 }, { moneda: "PAB", por_usd: 1 },      { moneda: "MXN", por_usd: 18.5 },
+      { moneda: "COP", por_usd: 4000 },  { moneda: "CLP", por_usd: 950 }
     ],
-    fecha_tipos_cambio: "",
+    fecha_tipos_cambio: "Registro 01.10.2026 al 31.10.2026",
     paises: [
       { pais: "Costa Rica",           moneda: "CRC", iva_pct: 13, codigos: ["BT", "CR"], iva_desglosado: true },
       { pais: "Guatemala",            moneda: "GTQ", iva_pct: 12, codigos: ["GT"], iva_desglosado: true },
@@ -166,6 +204,87 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .chip.ok{background:var(--ok-bg);color:var(--ok)} .chip.warn{background:var(--warn-bg);color:var(--warn)}
 .chip.error{background:var(--err-bg);color:var(--err)} .chip.na{background:var(--na-bg);color:var(--na)}
 .chip.proc{background:#E8F0FE;color:#1A56C4}
+/* ===================== PLATAFORMA (shell tipo ERP) ===================== */
+:root{--side:#262B31;--side-2:#30363D;--side-txt:#C9CED4;--top:#1B1F24}
+.ico{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.topbar{position:sticky;top:0;z-index:30;height:52px;background:var(--top);color:#fff;display:flex;align-items:center;gap:12px;padding:0 14px 0 8px;box-shadow:0 1px 0 rgba(255,255,255,.06)}
+.hamb{background:none;border:0;color:#fff;width:40px;height:40px;border-radius:8px;display:grid;place-items:center;cursor:pointer}
+.hamb:hover{background:rgba(255,255,255,.1)} .hamb .ico{width:22px;height:22px}
+.plat-marca{display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none;font-weight:700;font-size:15px;white-space:nowrap}
+.plat-marca i{width:8px;height:24px;background:var(--primario);border-radius:2px}
+.miga{color:#9AA3AD;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .miga:not(:empty)::before{content:"/";margin:0 10px 0 2px;color:#5C6570}
+.topbar .usuario{margin-left:auto;display:flex;align-items:center;gap:10px;color:#C9CDD2;font-size:13px}
+.shell{display:flex;min-height:calc(100vh - 52px)}
+.side{width:244px;flex:none;background:var(--side);color:var(--side-txt);position:sticky;top:52px;height:calc(100vh - 52px);overflow-y:auto;overflow-x:hidden;transition:width .18s ease;padding:10px 0}
+.side a{display:flex;align-items:center;gap:12px;padding:9px 16px 9px 18px;margin:1px 8px;border-radius:7px;color:var(--side-txt);text-decoration:none;font-size:13.5px;white-space:nowrap;position:relative}
+.side a:hover{background:var(--side-2);color:#fff}
+.side a.activo{background:#3A4149;color:#fff;font-weight:600}
+.side a.activo::before{content:"";position:absolute;left:-8px;top:8px;bottom:8px;width:3px;border-radius:0 3px 3px 0;background:var(--primario)}
+.side .grupo{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#7D8792;padding:14px 26px 6px;white-space:nowrap}
+.side .lbl{overflow:hidden;text-overflow:ellipsis}
+body.side-min .side{width:64px} body.side-min .side .lbl, body.side-min .side .grupo{display:none} body.side-min .side a{justify-content:center;padding:10px 0;margin:2px 10px}
+.contenido{flex:1;min-width:0}
+.velo{display:none}
+header.modbar{background:#fff;color:var(--tinta);border-bottom:1px solid var(--borde);top:52px;height:50px;z-index:20;padding:0 20px}
+header.modbar .marca{font-size:15px}
+header.modbar nav{align-self:stretch}
+header.modbar nav button{color:var(--tinta-2);border-radius:0;border-bottom:2px solid transparent;padding:0 14px;height:100%}
+header.modbar nav button:hover{color:var(--tinta);background:#F7F8F9}
+header.modbar nav button.activo{background:none;color:var(--tinta);border-bottom-color:var(--primario);font-weight:600}
+.bienvenida{margin:8px 0 18px} .bienvenida h1{margin:0 0 4px;font-size:22px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.tile{display:flex;flex-direction:column;gap:10px;background:var(--tarjeta);border:1px solid var(--borde);border-radius:var(--radio);padding:18px;text-decoration:none;color:var(--tinta);box-shadow:var(--sombra);transition:border-color .15s,transform .15s}
+.tile:hover{border-color:#C4CAD1;transform:translateY(-1px)}
+.tile .t-ico{width:42px;height:42px;border-radius:10px;display:grid;place-items:center;background:#FDECEE;color:var(--primario)}
+.tile .t-ico .ico{width:22px;height:22px}
+.tile b{font-size:15px} .tile p{margin:0;color:var(--tinta-2);font-size:13px;flex:1}
+.tile .ir{font-size:13px;font-weight:600;color:var(--primario)}
+.tile.prox{opacity:.7} .tile.prox .t-ico{background:#EEF0F2;color:var(--tenue)}
+.vacio{text-align:center;padding:40px 20px} .vacio-ico{display:inline-grid;place-items:center;width:56px;height:56px;border-radius:14px;background:#EEF0F2;color:var(--tenue);margin-bottom:10px} .vacio-ico .ico{width:28px;height:28px}
+.nu-mods{display:flex;flex-wrap:wrap;gap:4px 0;min-height:34px;align-items:center}
+.cred{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px;padding:10px 12px;border:1px solid var(--ok);background:var(--ok-bg);border-radius:8px;font-size:13px}
+.cred code{background:#fff;padding:2px 6px;border-radius:4px;border:1px solid var(--borde)}
+.mod-chk{display:inline-flex;align-items:center;gap:6px;font-size:12px;margin:2px 10px 2px 0;white-space:nowrap;cursor:pointer}
+.login-marca{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;margin-bottom:6px} .login-marca i{width:8px;height:24px;background:var(--primario);border-radius:2px}
+@media (max-width:900px){
+  .side{position:fixed;left:0;top:52px;z-index:40;transform:translateX(-100%);transition:transform .2s ease;width:260px;box-shadow:4px 0 18px rgba(0,0,0,.25)}
+  body.side-abierta .side{transform:none}
+  body.side-abierta .velo{display:block;position:fixed;inset:52px 0 0 0;background:rgba(0,0,0,.35);z-index:35}
+  body.side-min .side{width:260px} body.side-min .side .lbl, body.side-min .side .grupo{display:initial} body.side-min .side a{justify-content:flex-start;padding:9px 16px 9px 18px;margin:1px 8px}
+  .topbar .usuario span{display:none} .miga{display:none}
+  header.modbar{padding:0 10px} header.modbar .marca span{display:none}
+}
+@media (max-width:560px){.plat-marca span{display:none} .topbar{gap:6px} .topbar .usuario{gap:6px} .topbar .btn.chico{padding:4px 7px}}
+.sug-panel{margin-top:14px;padding:12px 14px;border:1px dashed var(--borde);border-radius:8px;background:#FBFCFD}
+.sug-panel .fila b{font-size:13px}
+#tSug td.txt{min-width:320px;white-space:pre-wrap} #tSug select{min-width:170px}
+.chip.regla{background:#EEF3FF;color:#1A56C4}
+/* ---- Capacidad de IA ---- */
+.cap{--uso:#1A56C4;--pista:#E6E9EE;padding:14px 18px}
+.cap-cab{display:flex;gap:20px;align-items:stretch;flex-wrap:wrap}
+.cap-hero{flex:0 0 196px;display:flex;flex-direction:column;justify-content:center;gap:4px;padding-right:20px;border-right:1px solid var(--borde)}
+.cap-tit{font-size:12px;font-weight:600;color:var(--tinta-2);text-transform:uppercase;letter-spacing:.04em}
+.cap-num b{font-size:30px;line-height:1;color:var(--tinta);font-variant-numeric:tabular-nums} .cap-num span{font-size:13px;color:var(--tinta-2)}
+.cap-meter{height:8px;border-radius:4px;background:var(--pista);overflow:hidden;margin-top:4px}
+.cap-meter i{display:block;height:100%;border-radius:4px;background:var(--uso);transition:width .4s}
+.cap-sub{font-size:12px;color:var(--tenue)}
+.cap-modelos{flex:1;align-self:center;display:grid;grid-template-columns:repeat(auto-fill,minmax(124px,1fr));gap:6px;min-width:0}
+.cap-m{position:relative;display:flex;align-items:center;gap:6px;padding:8px 6px;border:1px solid var(--borde);border-radius:8px;background:#fff;cursor:default}
+.cap-m:hover,.cap-m:focus{border-color:#B9C3D3;outline:none}
+.cap-m.agotado{background:#FAFAFB} .cap-m.agotado .cap-anillo .v{stroke:#B7BDC6}
+.cap-anillo{flex:none;width:34px;height:34px} .cap-anillo circle{fill:none;stroke-width:5} .cap-anillo .p{stroke:var(--pista)}
+.cap-anillo .v{stroke:var(--uso);stroke-linecap:round;transition:stroke-dasharray .4s}
+.cap-anillo text{font-size:9.5px;letter-spacing:-.02em;font-weight:700;fill:var(--tinta);text-anchor:middle;dominant-baseline:central;font-variant-numeric:tabular-nums}
+.cap-m .nom{font-size:11.5px;font-weight:600;color:var(--tinta);line-height:1.2;white-space:nowrap}
+.cap-m .det{font-size:11px;color:var(--tenue);font-variant-numeric:tabular-nums}
+.cap-m .est{font-size:11px;font-weight:600;white-space:nowrap} .est.ok{color:var(--ok)} .est.warn{color:var(--warn)} .est.error{color:var(--err)}
+.cap-m .pri{position:absolute;bottom:4px;right:6px;font-size:10px;color:var(--tenue)}
+.cap-pie{display:flex;align-items:center;gap:8px;margin-top:10px} .cap-orden{flex:1;font-size:12px;color:var(--tenue)}
+.cap-tabla{border-collapse:collapse;width:100%;margin-top:8px;font-size:13px} .cap-tabla th,.cap-tabla td{padding:4px 8px;border-bottom:1px solid var(--borde);text-align:left}
+.cap-tabla td.n{text-align:right;font-variant-numeric:tabular-nums}
+[data-tip]{position:relative} .cap-info{cursor:help;color:var(--tenue);text-transform:none}
+.cap-tip{position:fixed;z-index:50;max-width:260px;background:var(--tinta);color:#fff;font-size:12px;line-height:1.4;padding:6px 9px;border-radius:6px;pointer-events:none;box-shadow:0 4px 14px rgba(0,0,0,.18)}
+@media (max-width:640px){.cap-hero{flex:1 1 100%;border-right:0;padding-right:0;border-bottom:1px solid var(--borde);padding-bottom:10px}}
 .resumen{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:14px}
 .kpi{border:1px solid var(--borde);border-radius:8px;padding:12px;background:#fff}
 .kpi .v{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums}
@@ -204,6 +323,13 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
 .pagina .pag-body{flex:1;min-width:0}
 .pagina textarea{font-family:ui-monospace,Consolas,monospace;font-size:12px}
 .lista-archivos.copilot{max-height:none;gap:10px}
+.det-lineas{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:4px}
+.det-lineas .chip{white-space:normal;font-weight:500}
+.anulado{opacity:.55;text-decoration:line-through}
+.acciones{display:flex;flex-direction:column;gap:6px;align-items:flex-start;min-width:120px}
+.acciones label{display:flex;gap:6px;align-items:center;font-size:12px;cursor:pointer;white-space:nowrap}
+.btn-basura{border:1px solid var(--borde);background:#fff;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:13px}
+.btn-basura:hover{background:var(--err-bg);border-color:var(--err)}
 @media (max-width:720px){.pagina{flex-direction:column}.pagina .thumb{width:100%;height:200px}}
 @media (max-width:720px){header{padding:0 10px}header .marca span{display:none}header nav{margin-left:0}header .usuario span{display:none}main{padding:12px}}
 </style>
@@ -213,8 +339,8 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
 <!-- ============ LOGIN ============ -->
 <div id="vLogin" class="login oculto">
   <div class="tarjeta">
-    <h2 style="font-size:18px">Revisor de Gastos SAP</h2>
-    <p class="sub">Ingresa con tu cuenta del equipo.</p>
+    <div class="login-marca"><i></i><span id="loginNombre">Agentes IA LCA</span></div>
+    <p class="sub">Ingresa con tu cuenta. Verás los módulos que el administrador te asignó.</p>
     <div id="loginMsg"></div>
     <form id="fLogin">
       <div class="campo" style="margin-bottom:10px"><label>Correo</label><input type="email" id="lEmail" required autocomplete="username"></div>
@@ -227,20 +353,56 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
 
 <!-- ============ APP ============ -->
 <div id="vApp" class="oculto">
-<header>
-  <div class="marca"><i></i><span>Revisor de Gastos SAP</span></div>
+<div class="topbar">
+  <button class="hamb" id="bMenu" title="Mostrar u ocultar el menú" aria-label="Menú"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+  <a class="plat-marca" href="#/inicio"><i></i><span id="platNombre">Agentes IA LCA</span></a>
+  <span class="miga" id="miga"></span>
+  <div class="usuario"><span id="uEmail"></span><button class="btn chico" id="bMiClave" title="Cambiar mi contraseña">Mi contraseña</button><button class="btn chico" id="bSalir">Salir</button></div>
+</div>
+<div class="shell">
+<aside class="side" id="side" aria-label="Módulos"><nav id="sideNav"></nav></aside>
+<div class="velo" id="velo"></div>
+<div class="contenido">
+
+<!-- ======================= INICIO ======================= -->
+<div id="mInicio" class="modulo">
+<main>
+  <div class="bienvenida"><h1 id="saludo">Hola</h1><p class="sub" style="margin:0">Elige un módulo para empezar.</p></div>
+  <div id="avisoPlataforma"></div>
+  <div class="tiles" id="tilesInicio"></div>
+</main>
+</div>
+
+<!-- ======================= MÓDULO: REVISIÓN DE GASTOS SAP ======================= -->
+<div id="mRevisor" class="modulo oculto">
+<header class="modbar">
+  <div class="marca"><i></i><span>Revisión de gastos SAP</span></div>
   <nav>
     <button data-tab="nueva" class="activo">Nueva revisión</button>
     <button data-tab="historial">Historial</button>
     <button data-tab="politicas">Políticas</button>
-    <button data-tab="usuarios" id="navUsuarios" class="oculto">Usuarios</button>
+    <button data-tab="sugerencias">Sugerencias</button>
   </nav>
-  <div class="usuario"><span id="uEmail"></span><button class="btn chico" id="bMiClave" title="Cambiar mi contraseña">Mi contraseña</button><button class="btn chico" id="bSalir">Salir</button></div>
 </header>
 
 <main>
 <!-- ===== NUEVA REVISIÓN ===== -->
 <section id="tNueva">
+  <div class="tarjeta cap oculto" id="capIA" aria-live="polite">
+    <div class="cap-cab">
+      <div class="cap-hero">
+        <div class="cap-tit">Capacidad de IA hoy <span class="cap-info" tabindex="0" data-tip="Compartida por todo el equipo. Cada página usa el modelo más potente con cupo; al agotarse pasa al siguiente.">ⓘ</span></div>
+        <div class="cap-num"><b id="capLibres">–</b> <span>lecturas disponibles</span></div>
+        <div class="cap-meter" id="capMeter"><i></i></div>
+        <div class="cap-sub" id="capSub"></div>
+      </div>
+      <div class="cap-modelos" id="capModelos"></div>
+    </div>
+    <div class="cap-pie"><span class="cap-orden">Orden de uso: más potente → más rendidor</span>
+      <button class="btn chico" id="bCapTabla" aria-expanded="false">Ver tabla</button>
+      <button class="btn chico" id="bCap" title="Actualizar">↻</button></div>
+    <div class="scroll oculto" id="capTablaWrap"><table class="cap-tabla" id="tCap"></table></div>
+  </div>
   <div class="tarjeta">
     <h2><span class="paso">1</span>Reporte de informes de gastos (Excel de SAP)</h2>
     <p class="sub">Sube el reporte exportado de SAP ByD y escribe el número de informe que vas a revisar. Solo se comparan las líneas de ese informe.</p>
@@ -299,6 +461,10 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
       <div class="mini muted" style="margin-bottom:6px">Datos leídos. <b>Total</b> = total de la factura sin propina. Corrige cualquier celda; la categoría y la comida definen qué límite aplica.</div>
       <div class="scroll edit" style="max-height:520px"><table id="tFact"></table></div>
       <div class="fila" style="margin-top:8px"><button class="btn chico" id="bAgregarManual">+ Agregar factura manualmente</button></div>
+    </div>
+    <div id="movEdit" class="oculto" style="margin-top:16px">
+      <div class="mini muted" style="margin-bottom:6px">💳 <b>Movimientos de estado de cuenta</b>: no son comprobantes; se usan para validar cargos (monto, fecha y tipo de cambio) de las líneas de SAP.</div>
+      <div class="scroll" style="max-height:300px"><table id="tMov"></table></div>
     </div>
   </div>
 
@@ -368,19 +534,94 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
   </div>
 </section>
 
-<!-- ===== USUARIOS (solo administradores) ===== -->
-<section id="tUsuarios" class="oculto">
+<!-- ===== SUGERENCIAS DEL EQUIPO ===== -->
+<section id="tSugerencias" class="oculto">
   <div class="tarjeta">
-    <h2>Crear o eliminar usuarios</h2>
-    <p class="sub" style="margin:0">Se hace en el panel de Supabase: <b>Authentication → Users → Add user → Create new user</b> (marca <i>Auto Confirm User</i>). El usuario aparece aquí al actualizar, y desde esta pantalla le asignas nombre, rol y contraseña o lo bloqueas.</p>
+    <h2>💡 Sugerencias del equipo</h2>
+    <p class="sub">Criterios que la IA aplica en las siguientes revisiones. <b>Lectura</b>: al leer los comprobantes (ej. "En los recibos de Uber el total incluye la tarifa dinámica"). <b>Revisión</b>: al revisar los resultados ya comparados; aparecen como "💡 Regla del equipo" en el detalle (ej. "Las propinas siempre se registran aparte con sufijo -P"). Son compartidas por todo el equipo y queda registrado quién las creó o cambió.</p>
+    <div class="fila">
+      <div class="campo" style="flex:3"><label>Nueva sugerencia</label><textarea id="sugTexto" rows="2" maxlength="500" placeholder="Ej. Las propinas siempre se registran aparte; si vienen sumadas en el importe, indicarlo."></textarea></div>
+      <div class="campo" style="max-width:190px"><label>Se aplica en</label><select id="sugAlcance"><option value="ambas">Lectura y revisión</option><option value="revision">Solo revisión</option><option value="lectura">Solo lectura</option></select></div>
+      <button class="btn primario" id="bSugGuardar">Guardar sugerencia</button>
+    </div>
+    <div id="sugAviso"></div>
+    <div class="scroll" style="max-height:520px;margin-top:14px"><table id="tSug"></table></div>
   </div>
+</section>
+
+
+</main>
+</div><!-- /mRevisor -->
+
+<!-- ======================= ADMINISTRACIÓN (solo administradores) ======================= -->
+<div id="mAdmin" class="modulo oculto">
+<header class="modbar">
+  <div class="marca"><i></i><span>Administración</span></div>
+  <nav>
+    <button data-adm="usuarios" class="activo">Usuarios y accesos</button>
+    <button data-adm="modulos">Módulos</button>
+    <button data-adm="bitacora">Historial de accesos</button>
+  </nav>
+</header>
+<main>
+<section id="tUsuarios">
   <div class="tarjeta">
+    <h2>Crear usuario</h2>
+    <p class="sub">La cuenta queda lista para entrar con la contraseña temporal; el usuario puede cambiarla luego con <b>Mi contraseña</b>.</p>
+    <form id="fNuevoUsuario" autocomplete="off">
+      <div class="fila">
+        <div class="campo"><label>Nombre</label><input type="text" id="nuNombre" maxlength="80" placeholder="Ej. Ana Mora" required></div>
+        <div class="campo"><label>Correo</label><input type="email" id="nuEmail" maxlength="120" placeholder="ana.mora@legrand.com" required autocomplete="off"></div>
+        <div class="campo" style="max-width:260px"><label>Contraseña temporal</label>
+          <div class="fila" style="gap:6px;flex-wrap:nowrap"><input type="text" id="nuClave" minlength="8" maxlength="72" required autocomplete="new-password"><button type="button" class="btn chico" id="bGenClave" title="Generar una contraseña segura">Generar</button></div></div>
+      </div>
+      <div class="fila" style="margin-top:10px;align-items:center">
+        <div class="campo" style="flex:3"><label>Módulos que puede usar</label><div id="nuModulos" class="nu-mods"></div></div>
+        <label class="check" style="flex:none"><input type="checkbox" id="nuAdmin"> Administrador (ve todos los módulos y administra la plataforma)</label>
+        <button class="btn primario" type="submit" id="bCrearUsuario">Crear usuario</button>
+      </div>
+    </form>
+    <div id="nuResultado"></div>
+  </div>
+<div class="tarjeta">
     <div class="fila" style="justify-content:space-between;align-items:center"><h2 style="margin:0">Usuarios</h2><button class="btn chico" id="bRefrescarUsuarios">Actualizar</button></div>
     <div class="scroll" style="max-height:none;margin-top:12px"><table id="tUsers"></table></div>
   </div>
 </section>
+<section id="aModulos" class="oculto">
+  <div class="tarjeta">
+    <h2>Módulos de la plataforma</h2>
+    <p class="sub">Cada agente es un módulo. Un módulo desactivado desaparece para todos (también para su IA y sus datos). Un módulo nuevo se muestra "en construcción" hasta que su pantalla se agregue al <code>index.html</code>.</p>
+    <div class="scroll" style="max-height:none"><table id="tModulos"></table></div>
+    <h3>Agregar módulo</h3>
+    <div class="fila">
+      <div class="campo" style="max-width:200px"><label>Clave (minúsculas, sin espacios)</label><input type="text" id="nmClave" placeholder="ej. conciliacion_bancaria" maxlength="40"></div>
+      <div class="campo" style="max-width:260px"><label>Nombre</label><input type="text" id="nmNombre" placeholder="ej. Conciliación bancaria" maxlength="80"></div>
+      <div class="campo"><label>Descripción</label><input type="text" id="nmDesc" maxlength="240"></div>
+      <button class="btn primario" id="bNuevoModulo">Agregar</button>
+    </div>
+  </div>
+</section>
+<section id="aBitacora" class="oculto">
+  <div class="tarjeta">
+    <h2>Historial de accesos</h2>
+    <p class="sub">Quién asignó o retiró cada módulo y cuándo. Lo registra la base de datos; no se puede editar ni borrar.</p>
+    <div class="scroll" style="max-height:560px"><table id="tBitacora"></table></div>
+  </div>
+</section>
 </main>
+</div><!-- /mAdmin -->
+
+<!-- ======================= MÓDULO EN CONSTRUCCIÓN ======================= -->
+<div id="mProx" class="modulo oculto">
+<main><div class="tarjeta vacio"><div class="vacio-ico"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z"/></svg></div>
+  <h2 id="proxNombre" style="justify-content:center">Módulo</h2><p class="sub" id="proxDesc"></p>
+  <p class="mini muted">Este módulo está registrado pero su pantalla aún no está publicada.</p></div></main>
 </div>
+
+</div><!-- /contenido -->
+</div><!-- /shell -->
+</div><!-- /vApp -->
 
 <div id="toast" class="toast oculto"></div>
 
@@ -441,6 +682,15 @@ function parseFecha(v) {
   if (m) return `${m[3].length === 2 ? "20" + m[3] : m[3]}-${pad(m[2])}-${pad(m[1])}`;
   return null;
 }
+/** Muestra YYYY-MM-DD como dd/mm/aaaa */
+const fFecha = iso => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ""); return m ? `${m[3]}/${m[2]}/${m[1]}` : (iso || ""); };
+/** Fecha con día y mes intercambiados (por si se leyó en formato EE.UU. MM/DD) */
+/** Fecha escrita a mano: si día y mes coinciden con SAP y solo cambia el año, se asume error de lectura del año */
+const mismoDiaMes = (a, b) => !!a && !!b && a.slice(5) === b.slice(5) && a.slice(0, 4) !== b.slice(0, 4);
+const fechaIncierta = f => !!(f && (f.fecha_manuscrita || f.fecha_dudosa));
+/** Fecha a usar en validaciones de período: la de SAP cuando la manuscrita solo difiere en el año */
+const fechaEfectiva = (f, l) => fechaIncierta(f) && l?.fecha_gasto && mismoDiaMes(f.fecha, l.fecha_gasto) ? l.fecha_gasto : f.fecha;
+const fechaInvertida = iso => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ""); return m && +m[3] <= 12 && m[2] !== m[3] ? `${m[1]}-${m[3]}-${m[2]}` : null; };
 function difDiasFirmado(a, b) { // b - a en días
   if (!a || !b) return null;
   const [y1, m1, d1] = a.split("-").map(Number), [y2, m2, d2] = b.split("-").map(Number);
@@ -456,6 +706,10 @@ function normMoneda(v) {
   if (/^(hnl|lempira|lempiras)$/.test(s)) return "HNL";
   if (/^(nio|cordoba|cordobas)$/.test(s)) return "NIO";
   if (/^(dop|rd)$/.test(s)) return "DOP";
+  const n = normTxt(raw);
+  const nombres = [["dolar", "USD"], ["colon", "CRC"], ["quetzal", "GTQ"], ["lempira", "HNL"], ["cordoba", "NIO"], ["peso dominicano", "DOP"],
+    ["balboa", "PAB"], ["peso chileno", "CLP"], ["peso colombiano", "COP"], ["peso mexicano", "MXN"], ["euro", "EUR"]];
+  for (const [k, c] of nombres) if (n.includes(k)) return c;
   return s ? s.toUpperCase().slice(0, 3) : null;
 }
 const soloDigitos = v => String(v ?? "").replace(/\D/g, "").replace(/^0+/, "");
@@ -472,6 +726,10 @@ function simNombre(a, b) {
   // Tokens que coinciden aunque la lectura tenga 1-2 letras distintas ("GUARCO" ≈ "CUARCO")
   const A = [...new Set(x.split(" "))], B = [...new Set(y.split(" "))];
   const parecidos = (a, b) => a === b || (Math.min(a.length, b.length) >= 4 && lev(a, b) <= (Math.max(a.length, b.length) >= 8 ? 2 : 1));
+  // Si todas las palabras significativas del nombre corto están en el largo ("ACACYA DE R.L." ⊂ "Asociación Cooperativa… ACACYA")
+  const [corto, largo] = A.length <= B.length ? [A, B] : [B, A];
+  const sig = corto.filter(t => t.length >= 3);
+  if (sig.length && sig.every(t => largo.some(u => parecidos(t, u)))) return Math.max(0.85, sig.length / largo.length);
   const usados = new Set(); let comunes = 0;
   A.forEach(a => { const j = B.findIndex((b, k) => !usados.has(k) && parecidos(a, b)); if (j > -1) { usados.add(j); comunes++; } });
   return comunes / (A.length + B.length - comunes);
@@ -487,9 +745,13 @@ function lev(a, b) {
   }
   return prev[n];
 }
+/** Número de documento normalizado: segmentos sin ceros de relleno ("DTE-01-M001P001-000003670" → "DTE|1|M001P001|3670") */
+const normNumDoc = v => sinAcentos(v).toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean).map(p => /^\d+$/.test(p) ? p.replace(/^0+(?=\d)/, "") : p).join("|");
 function matchNumero(f, valorExcel) {
   const ex = String(valorExcel ?? "").trim();
   if (!ex) return null;
+  const nEx = normNumDoc(ex);
+  if (nEx && [f.numero, f.clave].filter(Boolean).some(c => normNumDoc(c) === nEx)) return "exacto";
   const cands = [f.numero, f.clave, f.serie && f.numero ? f.serie + f.numero : null].filter(Boolean);
   const dEx = soloDigitos(ex), aEx = alfanum(ex);
   for (const c of cands) { const dC = soloDigitos(c), aC = alfanum(c); if ((aC && aC === aEx) || (dC && dC.length >= 3 && dC === dEx)) return "exacto"; }
@@ -509,7 +771,7 @@ const u8ToB64 = u8 => { let s = ""; for (let i = 0; i < u8.length; i += 0x8000) 
 const S = {
   excel: { nombre: "", wb: null, hoja: "", raw: [], headerIdx: 0, headers: [], map: {} },
   informeId: "", cab: null, lineas: [], paisEmpresa: "", monedaLocal: "",
-  archivos: [], facturas: [], resultados: null, procesando: false,
+  archivos: [], facturas: [], movimientos: [], resultados: null, procesando: false,
   politica: clonar(C.POLITICA_DEFECTO), politicaMeta: null, esAdmin: false, regimen: "auto"
 };
 const P = () => S.politica;
@@ -529,7 +791,9 @@ const CAMPOS_EXCEL = [
   ["proveedor", "Proveedor", false], ["empleado", "Empleado", false], ["texto", "Texto del informe", false],
   ["empresa", "Empresa (texto)", false], ["empresa_cod", "Empresa (código)", false], ["pais", "País/Región", false],
   ["estado", "Estado", false], ["fecha_cont", "Fecha de contabilización", false], ["aprobador", "Aprobador", false],
-  ["id_gasto", "ID de gastos", true], ["fecha_gasto", "Fecha de gasto", true], ["finalidad", "Finalidad", false]
+  ["id_gasto", "ID de gastos", true], ["fecha_gasto", "Fecha de gasto", true], ["finalidad", "Finalidad", false],
+  ["tipo_gasto", "Tipo de gasto", false], ["categoria_gasto", "Categoría de gasto", false], ["moneda_gasto", "Moneda de gastos", false],
+  ["fecha_inicio", "Fecha de inicio", false], ["fecha_fin", "Fecha de fin", false], ["salida", "Salida desde", false], ["llegada", "Llegada a", false]
 ];
 
 /* =====================================================================
@@ -559,10 +823,14 @@ async function mostrarSesion(session) {
   const nombre = session.user.user_metadata?.nombre;
   $("#uEmail").textContent = nombre ? `${nombre} · ${session.user.email}` : session.user.email;
   sesionUid = session.user.id;
+  S.usuario = nombre || session.user.email;
+  $("#saludo").textContent = `Hola, ${(nombre || session.user.email).split(/[ @]/)[0]}`;
   if (sesionCargada === sesionUid) return;
   sesionCargada = sesionUid;
-  await cargarPolitica();
-  $("#navUsuarios").classList.toggle("oculto", !S.esAdmin);
+  await cargarPolitica();               // también determina si es administrador
+  await cargarPlataforma();
+  if (puedeUsar(MOD_REVISOR)) { cargarCapacidadAhora(); contarReglas(); }
+  navegar();
 }
 async function cambiarClave() {
   const nueva = prompt("Escribe tu nueva contraseña (mínimo 8 caracteres):");
@@ -585,12 +853,13 @@ $("#lOlvido").addEventListener("click", async e => {
 $("#bSalir").addEventListener("click", () => sb.auth.signOut());
 $("#bMiClave").addEventListener("click", cambiarClave);
 
-$$("header nav button").forEach(b => b.addEventListener("click", () => {
-  $$("header nav button").forEach(x => x.classList.toggle("activo", x === b));
-  ["nueva", "historial", "politicas", "usuarios"].forEach(t => $("#t" + t[0].toUpperCase() + t.slice(1)).classList.toggle("oculto", b.dataset.tab !== t));
+$$("#mRevisor header nav button").forEach(b => b.addEventListener("click", () => {
+  $$("#mRevisor header nav button").forEach(x => x.classList.toggle("activo", x === b));
+  ["nueva", "historial", "politicas", "sugerencias"].forEach(t => $("#t" + t[0].toUpperCase() + t.slice(1)).classList.toggle("oculto", b.dataset.tab !== t));
   if (b.dataset.tab === "historial") cargarHistorial();
   if (b.dataset.tab === "politicas") { renderPolitica(); cargarHistorialPolitica(); }
   if (b.dataset.tab === "usuarios") cargarUsuarios();
+  if (b.dataset.tab === "sugerencias") cargarSugerencias();
 }));
 
 /* =====================================================================
@@ -678,13 +947,15 @@ function filasExcelTodas() {
   return S.excel.raw.slice(S.excel.headerIdx + 1).map((r, i) => {
     if (!r) return null;
     const g = k => (m[k] === undefined ? null : r[m[k]]);
-    const t = k => (g(k) === null ? "" : String(g(k)).trim());
+    const t = k => { const v = g(k) === null ? "" : String(g(k)).trim(); return v === "#" ? "" : v; };   // "#" = vacío en SAP
     return {
       fila: S.excel.headerIdx + 2 + i, informe: t("informe"), numero: t("numero"), proveedor: t("proveedor"),
       monto: parseNum(g("monto")), monto_local: parseNum(g("monto_local")), impuesto: parseNum(g("impuesto")) || 0, codigo_impuesto: t("codigo_impuesto"),
       empleado: t("empleado"), texto: t("texto"), empresa: t("empresa"), empresa_cod: t("empresa_cod"), pais: t("pais"),
       estado: t("estado"), fecha_cont: parseFecha(g("fecha_cont")), aprobador: t("aprobador"),
-      id_gasto: t("id_gasto"), fecha_gasto: parseFecha(g("fecha_gasto")), finalidad: t("finalidad") === "#" ? "" : t("finalidad")
+      id_gasto: t("id_gasto"), fecha_gasto: parseFecha(g("fecha_gasto")), finalidad: t("finalidad"),
+      tipo_gasto: t("tipo_gasto"), categoria_gasto: t("categoria_gasto"), moneda: normMoneda(t("moneda_gasto")) || null,
+      fecha_inicio: parseFecha(t("fecha_inicio")), fecha_fin: parseFecha(t("fecha_fin")), salida: t("salida"), llegada: t("llegada")
     };
   }).filter(r => r && (r.informe || r.numero));
 }
@@ -700,7 +971,7 @@ $("#iInforme").addEventListener("change", e => seleccionarInforme(e.target.value
 $("#iInforme").addEventListener("keydown", e => { if (e.key === "Enter") seleccionarInforme(e.target.value.trim()); });
 
 function seleccionarInforme(id) {
-  S.informeId = id; S.resultados = null; $("#resultados").classList.add("oculto");
+  S.informeId = id; S.resultados = null; S.guardado = false; $("#resultados").classList.add("oculto");
   const filas = filasExcelTodas().filter(r => normTxt(r.informe) === normTxt(id));
   if (!id || !filas.length) {
     S.cab = null; S.lineas = [];
@@ -741,7 +1012,8 @@ function agruparLineas(filas) {
   const lineas = [], porNum = new Map();
   const nueva = (r, base) => ({ id: uid(), filas: [r.fila], filas_propina: [], numero: base, proveedor: r.proveedor, monto: r.monto, monto_local: r.monto_local ?? r.monto,
     impuesto: r.impuesto, codigo_impuesto: r.codigo_impuesto, propina: 0, propina_local: 0, propina_imp: 0, solo_propina: false,
-    id_gasto: r.id_gasto, ids_propina: [], propinas: [], fecha_gasto: r.fecha_gasto, finalidad: r.finalidad });
+    id_gasto: r.id_gasto, ids_propina: [], propinas: [], fecha_gasto: r.fecha_gasto, finalidad: r.finalidad,
+    tipo_gasto: r.tipo_gasto, categoria_gasto: r.categoria_gasto, moneda: r.moneda, fecha_inicio: r.fecha_inicio, fecha_fin: r.fecha_fin, salida: r.salida, llegada: r.llegada });
   const bases = new Set(filas.filter(r => !re.test(r.numero)).map(r => alfanum(r.numero)));
   const esPropina = r => re.test(r.numero) && bases.has(alfanum(r.numero.match(re)[1].trim()));
   filas.filter(r => !esPropina(r)).forEach(r => {
@@ -752,7 +1024,7 @@ function agruparLineas(filas) {
     const base = r.numero.match(re)[1].trim();
     let l = porNum.get(alfanum(base));
     if (!l) { l = nueva(r, base); l.monto = 0; l.monto_local = 0; l.impuesto = 0; l.filas = []; l.solo_propina = true; l.id_gasto = r.id_gasto; lineas.push(l); porNum.set(alfanum(base), l); }
-    l.propinas.push({ id_gasto: r.id_gasto, fila: r.fila, numero: r.numero, monto: r.monto, monto_local: r.monto_local ?? r.monto, impuesto: r.impuesto, codigo_impuesto: r.codigo_impuesto, fecha_gasto: r.fecha_gasto });
+    l.propinas.push({ id_gasto: r.id_gasto, fila: r.fila, numero: r.numero, monto: r.monto, monto_local: r.monto_local ?? r.monto, impuesto: r.impuesto, codigo_impuesto: r.codigo_impuesto, fecha_gasto: r.fecha_gasto, tipo_gasto: r.tipo_gasto, moneda: r.moneda });
     l.filas_propina.push(r.fila); l.ids_propina.push(r.id_gasto + (r.numero.match(re)[2].toUpperCase() !== "P" ? ` (-${r.numero.match(re)[2].toUpperCase()})` : ""));
     l.propina += r.monto || 0; l.propina_local += (r.monto_local ?? r.monto) || 0; l.propina_imp += r.impuesto || 0;
   });
@@ -767,7 +1039,7 @@ function dibujarCabecera() {
     <div><b>Informe</b>${esc(c.informe)}</div><div><b>Colaborador</b>${esc(c.empleado)}</div>
     <div style="grid-column:span 2"><b>Descripción</b>${esc(c.texto)}</div>
     <div><b>Empresa</b>${esc(c.empresa)} <span class="muted">(${esc(c.empresa_cod)})</span></div>
-    <div><b>Estado SAP</b>${esc(c.estado)}</div><div><b>Contabilización</b>${esc(c.fecha_cont || "—")}</div>
+    <div><b>Estado SAP</b>${esc(c.estado)}</div><div><b>Contabilización</b>${esc(fFecha(c.fecha_cont) || "—")}</div>
     <div><b>Aprobador</b>${esc(c.aprobador)}</div><div><b>Total en moneda local</b>${esc(mm(S.monedaLocal, totLoc))}</div>
     <div><b>País de la empresa</b><select id="sPaisEmp">${opPais}</select></div>
     <div><b>Moneda local</b><select id="sMonLoc">${opMon}</select></div>
@@ -778,10 +1050,10 @@ function dibujarCabecera() {
 function dibujarPrevia() {
   $("#prevWrap").classList.remove("oculto");
   const ml = S.monedaLocal;
-  $("#tPrev").innerHTML = `<thead><tr><th>ID gasto</th><th>Fecha gasto</th><th>ID factura</th><th>Proveedor</th><th class="num">Importe</th><th class="num">Importe ${esc(ml || "local")}</th><th class="num">Impuesto</th><th>Cód. imp.</th><th class="num">Propina</th></tr></thead><tbody>` +
-    S.lineas.map(l => `<tr><td><b>${esc(l.solo_propina ? "" : l.id_gasto)}</b>${l.ids_propina.length ? ` <span class="muted mini">+ P ${esc(l.ids_propina.join(", "))}</span>` : ""}</td><td class="mini">${esc(l.fecha_gasto || "—")}</td>
+  $("#tPrev").innerHTML = `<thead><tr><th>ID gasto</th><th>Fecha gasto</th><th>Tipo de gasto</th><th>ID factura</th><th>Proveedor</th><th class="num">Importe</th><th class="num">Importe ${esc(ml || "local")}</th><th class="num">Impuesto</th><th>Cód. imp.</th><th class="num">Propina</th></tr></thead><tbody>` +
+    S.lineas.map(l => `<tr><td><b>${esc(l.solo_propina ? "" : l.id_gasto)}</b>${l.ids_propina.length ? ` <span class="muted mini">+ P ${esc(l.ids_propina.join(", "))}</span>` : ""}</td><td class="mini">${esc(fFecha(l.fecha_gasto) || "—")}${l.fecha_inicio ? `<div class="muted">${esc(fFecha(l.fecha_inicio))}–${esc(fFecha(l.fecha_fin))}</div>` : ""}</td><td class="mini">${esc(l.tipo_gasto)}</td>
       <td>${esc(l.numero)}${l.solo_propina ? ' <span class="chip warn">solo propina</span>' : ""}</td><td>${esc(l.proveedor)}</td>
-      <td class="num">${money(l.monto)}</td><td class="num">${money(l.monto_local)}${l.monto_local !== l.monto ? ' <span class="chip proc" title="El importe y el importe local difieren: hubo conversión de moneda">TC</span>' : ""}</td>
+      <td class="num">${esc(l.moneda || "")} ${money(l.monto)}</td><td class="num">${money(l.monto_local)}${l.monto_local !== l.monto ? ' <span class="chip proc" title="El importe y el importe local difieren: hubo conversión de moneda">TC</span>' : ""}</td>
       <td class="num">${money(l.impuesto)}</td><td>${esc(l.codigo_impuesto)}</td><td class="num">${l.propina ? money(l.propina) : ""}</td></tr>`).join("") + "</tbody>";
 }
 
@@ -806,7 +1078,7 @@ async function agregarArchivos(files) {
           const doc = await PDFLib.PDFDocument.create();
           const [pg] = await doc.copyPages(src, [i]); doc.addPage(pg);
           const bytes = await doc.save();
-          S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, nombre: n > 1 ? `${file.name} · pág. ${i + 1} de ${n}` : file.name, tipo: "application/pdf", bytes, size: bytes.length, estado: "pendiente", error: "", n: 0 });
+          S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, pagina: i + 1, nombre: n > 1 ? `${file.name} · pág. ${i + 1} de ${n}` : file.name, tipo: "application/pdf", bytes, size: bytes.length, estado: "pendiente", error: "", n: 0 });
         }
         continue;
       } catch (err) { console.warn("No se pudo dividir el PDF, se envía completo", err); }
@@ -818,16 +1090,23 @@ async function agregarArchivos(files) {
 function dibujarArchivos() {
   if (C.MODO_LECTURA === "copilot") return dibujarArchivosCopilot();
   const et = a => ({ pendiente: '<span class="chip na">Pendiente</span>', proc: '<span class="chip proc">Leyendo…</span>',
-    ok: `<span class="chip ${a.esperados && a.n !== a.esperados ? "warn" : "ok"}">✓ ${a.n}${a.esperados ? " de " + a.esperados : ""} comprobante${a.n === 1 ? "" : "s"}</span>`, error: '<span class="chip error">Error</span>' }[a.estado]);
+    ok: a.continuacion && !a.n && !a.nMov ? '<span class="chip na">Continuación de la página anterior</span>' : `${a.n || !a.nMov ? `<span class="chip ${a.esperados && a.n !== a.esperados ? "warn" : "ok"}">✓ ${a.n}${a.esperados ? " de " + a.esperados : ""} comprobante${a.n === 1 ? "" : "s"}</span>` : ""}${a.nMov ? ` <span class="chip proc">💳 ${a.nMov} movimiento${a.nMov === 1 ? "" : "s"}</span>` : ""}`, error: '<span class="chip error">Error</span>' }[a.estado]);
   $("#listaArch").innerHTML = S.archivos.map(a => `<div class="archivo">
-      <span class="n" title="${esc(a.nombre)}">${esc(a.nombre)} <span class="muted mini">(${(a.size / 1024).toFixed(0)} KB)</span></span>
+      <span class="n" title="${esc(a.nombre)}">${esc(a.nombre)} <span class="muted mini">(${(a.size / 1024).toFixed(0)} KB${a.modelo ? " · " + esc(a.modelo.replace(/^gemini-/, "")) : ""})</span></span>
       ${a.error ? `<span class="err">${esc(a.error)}</span>` : ""}${et(a)}
       ${a.estado === "error" ? `<button class="btn chico" data-reintentar="${a.id}">Reintentar</button>` : ""}
       ${a.estado === "ok" ? `<button class="btn chico" data-releer="${a.id}" title="Volver a leer con IA indicando cuántos comprobantes hay">Releer</button>` : ""}
+      ${a.estado === "ok" && a.n > 0 ? `<button class="btn chico" data-edc="${a.id}" title="La página es un estado de cuenta: convertir sus líneas en movimientos de tarjeta">Es estado de cuenta</button>` : ""}
       <button class="btn chico" data-quitar="${a.id}" ${S.procesando ? "disabled" : ""}>Quitar</button></div>`).join("");
   $$("[data-quitar]").forEach(b => b.addEventListener("click", () => {
     const id = b.dataset.quitar; S.archivos = S.archivos.filter(a => a.id !== id); S.facturas = S.facturas.filter(f => f.archivoId !== id);
+    S.movimientos = S.movimientos.filter(m => m.archivoId !== id);
     dibujarArchivos(); dibujarFacturas(); actualizarBotones();
+  }));
+  $$("[data-edc]").forEach(b => b.addEventListener("click", () => {
+    const a = S.archivos.find(x => x.id === b.dataset.edc);
+    if (!confirm(`¿Tratar "${a.nombre}" como estado de cuenta? Sus ${a.n} líneas dejarán de ser comprobantes y se usarán solo para validar cargos.`)) return;
+    convertirAEstadoDeCuenta(a); dibujarArchivos(); dibujarFacturas(); actualizarBotones();
   }));
   $$("[data-reintentar],[data-releer]").forEach(b => b.addEventListener("click", () => {
     const a = S.archivos.find(x => x.id === (b.dataset.reintentar || b.dataset.releer));
@@ -857,11 +1136,13 @@ async function extraerArchivo(a) {
     for (let intento = 0; ; intento++) {
       const r = await sb.functions.invoke(C.FUNCION_EXTRACCION, { body: { archivo: a.nombre, tipo, datos, esperados: a.esperados || null } });
       if (!r.error) { data = r.data; break; }
-      let msg = r.error.message, status = r.error.context?.status;
-      try { const j = await r.error.context.json(); msg = j.error || msg; } catch {}
-      if (status === 429 && intento < C.REINTENTOS_LIMITE) {
-        const espera = 20 * (intento + 1);
-        a.error = `Límite por minuto: reintentando en ${espera} s…`; dibujarArchivos();
+      let msg = r.error.message, status = r.error.context?.status, j = {};
+      try { j = await r.error.context.json(); msg = j.error || msg; } catch {}
+      if (status === 429 && !j.diario && intento < C.REINTENTOS_LIMITE) {
+        // El servidor indica cuántos segundos faltan para que se libere un turno; se agrega un desfase aleatorio
+        // para que varios usuarios no reintenten todos en el mismo segundo.
+        const espera = Math.min(65, (j.esperar || 15 + 10 * intento)) + Math.floor(Math.random() * 6);
+        a.error = `Modelos ocupados (otros usuarios leyendo): reintentando en ${espera} s…`; dibujarArchivos(); cargarCapacidad();
         await new Promise(res => setTimeout(res, espera * 1000));
         a.error = ""; dibujarArchivos(); continue;
       }
@@ -871,22 +1152,42 @@ async function extraerArchivo(a) {
       }
       throw new Error(msg);
     }
-    const lista = data?.facturas || [];
+    const lista = data?.facturas || [], movs = data?.movimientos || [];
     S.facturas = S.facturas.filter(f => f.archivoId !== a.id);
-    lista.forEach((f, i) => S.facturas.push(normalizarFactura(f, a, i, lista.length)));
-    a.n = lista.length; a.estado = lista.length ? "ok" : "error";
-    if (!lista.length) a.error = "No se encontró ningún comprobante";
+    const esCont = data?.tipo_pagina === "continuacion";
+    lista.forEach((f, i) => S.facturas.push(Object.assign(normalizarFactura(f, a, i, lista.length), esCont ? { esContinuacion: true } : {})));
+    S.movimientos = S.movimientos.filter(m => m.archivoId !== a.id);
+    movs.forEach(m => S.movimientos.push(normalizarMovimiento(m, a)));
+    cargarCapacidad();
+    a.n = lista.length; a.nMov = movs.length; a.tipoPagina = data?.tipo_pagina || "comprobantes"; a.modelo = data?.modelo || "";
+    const continuacion = data?.tipo_pagina === "continuacion";
+    a.estado = lista.length || movs.length || continuacion ? "ok" : "error";
+    if (continuacion && !lista.length) a.continuacion = true;
+    if (!lista.length && !movs.length && !continuacion) a.error = "No se encontró ningún comprobante ni movimiento";
     else if (a.esperados && lista.length !== a.esperados) a.error = `Se encontraron ${lista.length} de ${a.esperados} comprobantes indicados: revisa la página o agrega los faltantes manualmente`;
     if (data?.truncado) a.error = "Respuesta incompleta: revisa si faltan comprobantes";
   } catch (err) { console.error(err); a.estado = "error"; a.error = err.message || "Error desconocido"; }
   dibujarArchivos(); dibujarFacturas();
 }
+function normalizarMovimiento(m, a) {
+  const pais = String(m.pais || "").trim();
+  return { id: uid(), archivoId: a.id, archivo: a.nombre, fecha: parseFecha(m.fecha), comercio: String(m.comercio || "").trim(),
+    monto: parseNum(m.monto), moneda: normMoneda(m.moneda) || "USD", pais: infoPais(pais)?.pais || pais };
+}
+/** Convierte los "comprobantes" leídos de una página que en realidad es un estado de cuenta en movimientos */
+function convertirAEstadoDeCuenta(a) {
+  const fs = S.facturas.filter(f => f.archivoId === a.id);
+  fs.forEach(f => S.movimientos.push({ id: uid(), archivoId: a.id, archivo: a.nombre, fecha: f.fecha, comercio: f.proveedor, monto: (f.total || 0) + (f.propina || 0), moneda: f.moneda || "USD", pais: f.pais }));
+  S.facturas = S.facturas.filter(f => f.archivoId !== a.id);
+  a.nMov = (a.nMov || 0) + fs.length; a.n = 0; a.tipoPagina = "estado_de_cuenta";
+}
 function normalizarFactura(f, a, i, total) {
   const hora = /^\d{1,2}:\d{2}/.test(f.hora || "") ? f.hora.slice(0, 5).padStart(5, "0") : "";
   const out = {
-    id: uid(), archivoId: a.id, archivo: a.nombre + (total > 1 ? ` #${i + 1}` : ""),
+    id: uid(), archivoId: a.id, archivo: a.nombre + (total > 1 ? ` #${i + 1}` : ""), origen: a.origen || a.nombre, pagina: a.pagina || null, orden: i,
     numero: f.numero ? String(f.numero).trim() : "", serie: f.serie || "", clave: f.clave_numerica ? String(f.clave_numerica).replace(/\D/g, "") : "",
-    fecha: parseFecha(f.fecha_emision), hora, proveedor: f.proveedor_nombre || "", nit: f.proveedor_identificacion || "", receptor: f.receptor_nombre || "",
+    fecha: parseFecha(f.fecha_emision), hora, proveedor: f.proveedor_nombre || f.nombre_comercial || "",
+    nombre_comercial: f.nombre_comercial && normTxt(f.nombre_comercial) !== normTxt(f.proveedor_nombre) ? String(f.nombre_comercial).trim() : "", nit: f.proveedor_identificacion || "", receptor: f.receptor_nombre || "",
     pais: infoPais(f.pais_emisor)?.pais || f.pais_emisor || "", moneda: normMoneda(f.moneda) || "",
     categoria: normCategoria(f.categoria), tiempo: normTiempo(f.tiempo_comida), personas: parseInt(f.personas, 10) || null, noches: parseInt(f.noches, 10) || null,
     impuesto: parseNum(f.impuesto), iva_incluido: esVerdadero(f.iva_incluido), propina: parseNum(f.propina), total: parseNum(f.total),
@@ -896,6 +1197,10 @@ function normalizarFactura(f, a, i, total) {
     visibilidad: ["completa", "parcial", "ilegible"].includes(normTxt(f.visibilidad)) ? normTxt(f.visibilidad) : (f.legible === false ? "ilegible" : "completa"),
     no_visibles: (Array.isArray(f.campos_no_visibles) ? f.campos_no_visibles : String(f.campos_no_visibles || "").split(/[,;|]/)).map(x => String(x).trim()).filter(Boolean),
     es_fiscal: f.es_fiscal === undefined || f.es_fiscal === null ? true : esVerdadero(f.es_fiscal),
+    otros_cargos: parseNum(f.otros_cargos), otros_cargos_detalle: f.otros_cargos_detalle || "",
+    fecha_manuscrita: esVerdadero(f.fecha_manuscrita) || /(fecha|año|dia|día)[^.]*(manuscrit|a mano)|(manuscrit|a mano)[^.]*fecha/i.test(f.observaciones || ""),
+    fecha_dudosa: esVerdadero(f.fecha_dudosa) || /(fecha|año)[^.]*(parece|poco legible|ilegible|no se lee|dudos|incierto)/i.test(f.observaciones || "")
+      || (Array.isArray(f.campos_no_visibles) && f.campos_no_visibles.some(x => /fecha/i.test(x))),
     regimen: "auto", editada: false
   };
   // Costa Rica: el consecutivo oficial (20 dígitos) está dentro de la clave de 50 dígitos (posiciones 22-41).
@@ -907,6 +1212,11 @@ function normalizarFactura(f, a, i, total) {
       out.observaciones = [out.observaciones, `Número tomado de la clave numérica (la lectura indicaba "${out.numero || "—"}")`].filter(Boolean).join(" · ");
       out.numero = consecutivo;
     }
+  }
+  // Un comprobante con total 0 casi siempre es una mala lectura ("Amount Due $0.00" ya pagado): usar el total pagado
+  if (!(out.total > 0) && out.total_pagado > 0) {
+    out.total = out.total_pagado;
+    out.observaciones = [out.observaciones, "Total tomado del monto pagado (la lectura dio 0)"].filter(Boolean).join(" · ");
   }
   // Si la IA leyó el subtotal sin IVA como total: total + IVA + propina = total pagado → corregir
   if (out.impuesto > 0 && out.total !== null && out.total_pagado) {
@@ -942,6 +1252,69 @@ async function extraerTodas() {
   dibujarArchivos(); actualizarBotones();
 }
 $("#bExtraer").addEventListener("click", extraerTodas);
+/** Panel de capacidad compartida: lee el contador de la tabla uso_modelos (lo actualiza la función al leer) */
+let capPend = null, capTimer = null;
+function cargarCapacidad() { clearTimeout(capPend); capPend = setTimeout(cargarCapacidadAhora, 400); }
+const nombreModelo = m => m.replace(/^gemini-/, "").replace(/-preview$/, "").replace(/-latest$/, "")
+  .replace(/flash-lite/, "Flash‑Lite").replace(/flash/, "Flash").replace(/pro/, "Pro").replace(/-/g, " ");
+function anillo(pct) {
+  const r = 16, c = 2 * Math.PI * r, v = Math.max(0, Math.min(1, pct)) * c;
+  return `<svg class="cap-anillo" viewBox="0 0 40 40" aria-hidden="true"><circle class="p" cx="20" cy="20" r="${r}"/>` +
+    (v > 0 ? `<circle class="v" cx="20" cy="20" r="${r}" stroke-dasharray="${v} ${c}" transform="rotate(-90 20 20)"/>` : "") +
+    `<text x="20" y="20">${Math.round(pct * 100)}%</text></svg>`;
+}
+async function cargarCapacidadAhora() {
+  if (!sb) return;
+  const { data, error } = await sb.from(C.TABLA_USO_MODELOS).select("*");
+  if (error || !data) { $("#capIA").classList.add("oculto"); return; }   // tabla aún no creada: el panel no se muestra
+  const lista = data.filter(m => m.prioridad != null).sort((x, y) => x.prioridad - y.prioridad);
+  if (!lista.length) { $("#capIA").classList.add("oculto"); return; }
+  $("#capIA").classList.remove("oculto");
+  // día de cupo en hora del Pacífico, igual que en la base de datos
+  const hoy = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles" }).format(new Date());
+  const ahora = Date.now(), minActual = Math.floor(ahora / 60000);
+  let usados = 0, cupo = 0, libresMin = 0;
+  const filas = lista.map(m => {
+    const u = m.dia === hoy ? m.usados_dia : 0;
+    const hasta = m.agotado_hasta ? new Date(m.agotado_hasta).getTime() : 0;
+    const agotadoDia = (hasta > ahora && hasta - ahora > 120000) || u >= m.rpd;
+    const pausa = !agotadoDia && hasta > ahora;
+    const enMin = m.minuto && Math.floor(new Date(m.minuto).getTime() / 60000) === minActual ? m.usados_minuto : 0;
+    const usadosEf = agotadoDia ? m.rpd : u;
+    usados += usadosEf; cupo += m.rpd;
+    if (!agotadoDia && !pausa) libresMin += Math.max(0, m.rpm - enMin);
+    const est = agotadoDia ? { c: "error", t: "⛔ Agotado", l: "Agotado hoy" } : pausa ? { c: "warn", t: "⏸ En pausa", l: "En pausa (1 min)" } : { c: "ok", t: "● Disponible", l: "Disponible" };
+    return { m, u: usadosEf, enMin, est, agotadoDia };
+  });
+  const libres = Math.max(0, cupo - usados);
+  $("#capLibres").textContent = libres.toLocaleString("es-CR");
+  $("#capMeter i").style.width = `${cupo ? (libres / cupo) * 100 : 0}%`;
+  $("#capMeter").title = `${libres} de ${cupo} lecturas libres hoy`;
+  $("#capSub").textContent = `de ~${cupo.toLocaleString("es-CR")} hoy · ${libresMin} libres este minuto · reinicia 1:00 a. m.`;
+  $("#capModelos").innerHTML = filas.map(({ m, u, enMin, est, agotadoDia }) =>
+    `<div class="cap-m${agotadoDia ? " agotado" : ""}" tabindex="0" data-tip="${esc(m.modelo)} · ${u} de ${m.rpd} lecturas hoy · ${enMin} de ${m.rpm} en este minuto · ${est.l}">
+      <span class="pri">${m.prioridad}</span>${anillo(u / Math.max(1, m.rpd))}
+      <div><div class="nom">${esc(nombreModelo(m.modelo))}</div><div class="det">${u}/${m.rpd} hoy</div><div class="est ${est.c}">${est.t}</div></div></div>`).join("");
+  $("#tCap").innerHTML = `<tr><th>#</th><th>Modelo</th><th class="n">Lecturas hoy</th><th class="n">Cupo diario</th><th class="n">Este minuto</th><th>Estado</th></tr>` +
+    filas.map(({ m, u, enMin, est }) => `<tr><td>${m.prioridad}</td><td>${esc(m.modelo)}</td><td class="n">${u}</td><td class="n">${m.rpd}</td><td class="n">${enMin} / ${m.rpm}</td><td>${est.l}</td></tr>`).join("");
+  // refresco automático cada 30 s mientras la pestaña está visible
+  clearTimeout(capTimer); capTimer = setTimeout(() => { if (!document.hidden && !$("#tNueva").classList.contains("oculto")) cargarCapacidadAhora(); else cargarCapacidad(); }, 30000);
+}
+$("#bCap").addEventListener("click", cargarCapacidadAhora);
+$("#bCapTabla").addEventListener("click", e => {
+  const ab = $("#capTablaWrap").classList.toggle("oculto") === false;
+  e.currentTarget.setAttribute("aria-expanded", ab); e.currentTarget.textContent = ab ? "Ocultar tabla" : "Ver tabla";
+});
+// Tooltip ligero para elementos con data-tip (hover y foco con teclado)
+(() => {
+  let tip = null;
+  const mostrar = el => { tip ??= document.body.appendChild(Object.assign(document.createElement("div"), { className: "cap-tip" }));
+    tip.textContent = el.dataset.tip; tip.hidden = false; const r = el.getBoundingClientRect(), w = tip.offsetWidth;
+    tip.style.left = Math.max(8, Math.min(innerWidth - w - 8, r.left + r.width / 2 - w / 2)) + "px"; tip.style.top = (r.bottom + 6) + "px"; };
+  const ocultar = () => { if (tip) tip.hidden = true; };
+  ["mouseover", "focusin"].forEach(ev => document.addEventListener(ev, e => { const el = e.target.closest?.("[data-tip]"); el ? mostrar(el) : ocultar(); }));
+  ["mouseout", "focusout"].forEach(ev => document.addEventListener(ev, e => { if (e.target.closest?.("[data-tip]") && !e.relatedTarget?.closest?.("[data-tip]")) ocultar(); }));
+})();
 
 /* ---------- Modo Copilot Chat (gratis, copiar y pegar) ---------- */
 const PROMPT_COPILOT = [
@@ -969,8 +1342,8 @@ function normCategoria(v) {
   const c = normTxt(v);
   if (/alim|comid|restau|cafe/.test(c)) return "alimentacion";
   if (/hosped|hotel|aloja/.test(c)) return "hospedaje";
-  if (/transp|taxi|uber|bus|vuelo|aere/.test(c)) return "transporte";
-  if (/combust|gasol|diesel/.test(c)) return "combustible";
+  if (/combust|gasol|diesel/.test(c)) return "combustible";   // antes que transporte: "combustible" contiene "bus"
+  if (/transp|taxi|uber|\bbus\b|vuelo|aere/.test(c)) return "transporte";
   if (/parq/.test(c)) return "parqueo";
   return "otros";
 }
@@ -1113,7 +1486,17 @@ const COLS_FACT = [
   ["noches", "Noches", "int", 52], ["moneda", "Mon.", "text", 52], ["impuesto", "IVA", "num", 72], ["propina", "Propina", "num", 72],
   ["total", "Total s/propina", "num", 90], ["regimen", "Régimen", "select"]
 ];
+function dibujarMovimientos() {
+  $("#movEdit").classList.toggle("oculto", !S.movimientos.length);
+  $("#tMov").innerHTML = `<thead><tr><th>Fecha</th><th>Comercio</th><th>País</th><th class="num">Monto</th><th>Archivo</th><th></th></tr></thead><tbody>` +
+    S.movimientos.map(m => `<tr><td class="mini">${esc(fFecha(m.fecha))}</td><td>${esc(m.comercio)}</td><td class="mini">${esc(m.pais)}</td>
+      <td class="num">${esc(mm(m.moneda, m.monto))}</td><td class="mini muted">${esc(m.archivo)}</td>
+      <td><button class="btn chico" data-quitarmov="${m.id}" title="Quitar">✕</button></td></tr>`).join("") + "</tbody>";
+  $$("[data-quitarmov]").forEach(b => b.addEventListener("click", () => { S.movimientos = S.movimientos.filter(m => m.id !== b.dataset.quitarmov); dibujarMovimientos(); }));
+}
 function dibujarFacturas() {
+  dibujarMovimientos();
+  marcarFragmentos(S.facturas);
   $("#factEdit").classList.toggle("oculto", !S.facturas.length);
   const inp = (f, [k, , t, w]) => {
     if (t === "select") return `<select data-k="${k}">${OPC[k].map(([v, l]) => `<option value="${v}" ${String(f[k] ?? "") === v ? "selected" : ""}>${l}</option>`).join("")}</select>`;
@@ -1126,8 +1509,9 @@ function dibujarFacturas() {
         : `<span class="chip warn" title="${esc(f.observaciones)}">${f.legible ? Math.round(f.confianza * 100) + " %" : "Ilegible"}</span>`;
       const vis = f.visibilidad === "parcial" ? `<span class="chip warn" title="${esc((f.no_visibles || []).join(", "))}">Parcial</span>` : f.visibilidad === "ilegible" ? '<span class="chip error">Ilegible</span>' : "";
       const fiscal = f.es_fiscal === false ? '<span class="chip warn">No fiscal</span>' : "";
+      const frag = f.fragmentoDe ? `<span class="chip na" title="Se une al comprobante de la página anterior y no se compara por separado">Continuación pág. ${f.pagina - 1}</span>` : "";
       return `<tr data-id="${f.id}">
-        <td class="mini" style="min-width:150px;max-width:200px">${vis} ${fiscal} ${esc(f.archivo)}${f.alternos?.length ? `<div class="muted">Otros números: ${esc(f.alternos.join(", "))}</div>` : ""}${f.items ? `<div class="muted">${esc(f.items)}</div>` : ""}${f.observaciones ? `<div style="color:var(--warn)">${esc(f.observaciones)}</div>` : ""}</td>
+        <td class="mini" style="min-width:150px;max-width:200px">${frag} ${vis} ${fiscal} ${esc(f.archivo)}${f.alternos?.length ? `<div class="muted">Otros números: ${esc(f.alternos.join(", "))}</div>` : ""}${f.items ? `<div class="muted">${esc(f.items)}</div>` : ""}${f.observaciones ? `<div style="color:var(--warn)">${esc(f.observaciones)}</div>` : ""}</td>
         ${COLS_FACT.map(c => `<td>${inp(f, c)}</td>`).join("")}
         <td>${f.editada ? '<span class="chip na">Editada</span>' : conf}</td>
         <td><button class="btn chico" data-borrar="${f.id}" title="Quitar">✕</button></td></tr>`;
@@ -1141,7 +1525,7 @@ function dibujarFacturas() {
     else if (k === "pais") f[k] = infoPais(el.value)?.pais || el.value.trim();
     else f[k] = el.value.trim();
     if (el.tagName === "INPUT") el.value = f[k] ?? "";
-    f.editada = true; S.resultados = null;
+    f.editada = true; if (S.resultados) S._ultimo = S.resultados;
   }));
   $$("[data-borrar]").forEach(b => b.addEventListener("click", () => { S.facturas = S.facturas.filter(f => f.id !== b.dataset.borrar); dibujarFacturas(); actualizarBotones(); }));
   actualizarBotones();
@@ -1159,7 +1543,7 @@ function actualizarBotones() {
   $("#bExtraer").disabled = S.procesando || !pend;
   $("#bExtraer").textContent = pend ? `Leer ${pend} archivo${pend === 1 ? "" : "s"}/página${pend === 1 ? "" : "s"}` : "Leer facturas";
   const faltan = CAMPOS_EXCEL.filter(([k, , req]) => req && S.excel.map[k] === undefined).map(([, l]) => l);
-  const msg = !S.excel.raw.length ? "Falta el Excel" : faltan.length ? "Mapea: " + faltan.join(", ") : !S.lineas.length ? "Indica un número de informe válido" : !S.facturas.length ? "Faltan facturas leídas" : !S.monedaLocal ? "Elige la moneda local" : "";
+  const msg = !S.excel.raw.length ? "Falta el Excel" : faltan.length ? "Mapea: " + faltan.join(", ") : !S.lineas.length ? "Indica un número de informe válido" : !S.facturas.length && !S.movimientos.length ? "Faltan facturas leídas" : !S.monedaLocal ? "Elige la moneda local" : "";
   $("#bComparar").disabled = S.procesando || !!msg;
   $("#compInfo").textContent = msg;
 }
@@ -1179,9 +1563,32 @@ function compararImporte(valor, monedaFact, l, campo) {
   if (valor === null || valor === undefined || imp === null || imp === undefined) return { st: "na", nota: "" };
   const g = G(), tolA = g.tol_monto_abs, tolP = g.tol_monto_pct / 100, tolTc = g.tol_tc_pct / 100;
   const stMonto = (a, b) => Math.abs(a - b) <= tolA ? "ok" : rel(a, b) <= tolP ? "warn" : "error";
+  // SAP indica la moneda del gasto: comparación directa o con conversión, sin adivinar
+  const ms = l.moneda;
+  if (ms) {
+    const mismaMon = ms === m || (["USD", "PAB"].includes(ms) && ["USD", "PAB"].includes(m));
+    let r;
+    if (mismaMon) {
+      const st = stMonto(Math.abs(valor), Math.abs(imp));
+      r = { st, nota: st === "ok" ? "" : `Diferencia ${mm(m, Math.abs(valor) - Math.abs(imp))}`, interp: "sap" };
+    } else {
+      const conv = convertir(valor, m, ms);
+      if (conv === null) return { st: "warn", nota: `falta tipo de cambio ${m}/${ms} para comparar con SAP (${mm(ms, imp)})` };
+      const d = rel(imp, conv);
+      r = { st: d <= tolTc ? "ok" : d <= tolTc * 2 ? "warn" : "error", nota: `${mm(m, valor)} ≈ ${mm(ms, conv)} al TC de ref. vs ${mm(ms, imp)} en SAP${d > tolTc ? ` (${(d * 100).toFixed(1)} %)` : ""}`, interp: "sap" };
+    }
+    // Tipo de cambio que aplicó SAP a moneda local
+    if (ms !== local && imp && loc && Math.abs(loc - imp) > tolA) {
+      const impl = loc / imp, refTc = convertir(1, ms, local);
+      if (refTc && rel(impl, refTc) > tolTc) { r.st = peor([r.st, "warn"]); r.nota = `${r.nota ? r.nota + " · " : ""}TC ${ms}→${local} aplicado ${impl.toFixed(4)} (ref. ${refTc.toFixed(4)})`; }
+    }
+    return r;
+  }
   if (m === local) {
-    const st = stMonto(Math.abs(valor), Math.abs(imp));
-    return { st, nota: st === "ok" ? "" : `Diferencia ${mm(m, Math.abs(valor) - Math.abs(imp))}`, interp: "misma" };
+    // Si SAP aplicó tipo de cambio (importe ≠ importe local), el importe está en otra moneda: comparar contra el local
+    const ref = loc && Math.abs(loc - imp) > tolA ? loc : imp;
+    const st = stMonto(Math.abs(valor), Math.abs(ref));
+    return { st, nota: st === "ok" ? (ref !== imp ? `comparado con el importe local de SAP (${mm(local, loc)})` : "") : `Diferencia ${mm(m, Math.abs(valor) - Math.abs(ref))}${ref !== imp ? ` contra el importe local de SAP (${mm(local, loc)})` : ""}`, interp: "misma" };
   }
   // a) Registrado en la moneda de la factura
   if (Math.abs(valor - imp) <= tolA || rel(valor, imp) <= tolP) {
@@ -1219,12 +1626,16 @@ function puntaje(f, l) {
   if (!l.solo_propina) {
     const a = compararImporte(f.total, f.moneda, l, "monto");
     if (a.st === "ok") s += 25; else if (a.st === "warn") s += 15;
-    else if (f.impuesto > 0) { const c = compararImporte((f.total || 0) + f.impuesto, f.moneda, l, "monto"); if (c.st === "ok" || c.st === "warn") s += 18; }
+    else if (f.impuesto > 0 && ["ok", "warn"].includes(compararImporte((f.total || 0) + f.impuesto, f.moneda, l, "monto").st)) s += 18;
+    else if (f.total_pagado && ["ok", "warn"].includes(compararImporte(f.total_pagado, f.moneda, l, "monto").st)) s += 18;
     else if (f.propina) { const b = compararImporte((f.total || 0) + f.propina, f.moneda, l, "monto"); if (b.st === "ok" || b.st === "warn") s += 18; }
   }
-  const sim = simNombre(f.proveedor, l.proveedor);
+  const sim = simProveedor(f, l.proveedor);
   if (sim !== null && sim >= 0.5) s += 10 * sim;
-  const dd = f.fecha && l.fecha_gasto ? Math.abs(difDiasFirmado(f.fecha, l.fecha_gasto)) : null;
+  const ddN = f.fecha && l.fecha_gasto ? Math.abs(difDiasFirmado(f.fecha, l.fecha_gasto)) : null;
+  const inv = fechaInvertida(f.fecha), ddI = inv && l.fecha_gasto ? Math.abs(difDiasFirmado(inv, l.fecha_gasto)) : null;
+  let dd = ddN === null ? null : ddI !== null ? Math.min(ddN, ddI) : ddN;
+  if (fechaIncierta(f) && mismoDiaMes(f.fecha, l.fecha_gasto)) dd = 0;
   if (dd === 0) s += 8; else if (dd !== null && dd <= G().tol_fecha_dias) s += 4;
   return { s, num };
 }
@@ -1237,34 +1648,56 @@ function ivaEstimado(f) {
   return { iva: f.total - f.total / (1 + ip.iva_pct / 100), est: true, pct: ip.iva_pct };
 }
 
+/** La propina quedó sumada en el importe de la línea: avisar que va aparte, salvo que ya esté en otra línea del informe */
+function avisoPropinaIncluida(f, l) {
+  const mon = f.moneda || S.monedaLocal, monto = mm(mon, f.propina);
+  const otra = (S.lineas || []).find(o => o !== l && o.id_gasto !== l.id_gasto && !(o.propinas?.length && o.numero === l.numero)
+    && compararImporte(f.propina, f.moneda, o, "monto").st === "ok"
+    && (!o.fecha_gasto || !l.fecha_gasto || Math.abs(difDiasFirmado(o.fecha_gasto, l.fecha_gasto)) <= 1));
+  return otra
+    ? { c: "Propina", st: "warn", propinaIncluida: true, nota: `incluida en el importe de esta línea (${monto}), y la línea ${otra.id_gasto ?? ""} (${otra.numero || "sin número"}) tiene el mismo monto: posible doble registro, verificar` }
+    : { c: "Propina", st: "warn", propinaIncluida: true, nota: `incluida en el importe de esta línea (${monto}); debe registrarse aparte como línea -P` };
+}
 function evaluarPar(f, l, num) {
   const campos = [], notas = [], g = G();
   const m = f.moneda || S.monedaLocal;
   // Si el número no coincide pero monto y proveedor sí (ej. tiquetes sin número donde SAP usa fecha-hora), es advertencia
-  const simP = simNombre(f.proveedor, l.proveedor), montoOk = compararImporte(f.total, f.moneda, l, "monto").st === "ok";
-  const sinNumeroVisible = !f.numero && (f.visibilidad !== "completa" || (f.no_visibles || []).some(x => /num/i.test(x)));
+  const simP = simProveedor(f, l.proveedor), montoOk = compararImporte(f.total, f.moneda, l, "monto").st === "ok";
+  if (!f.numero && !f.clave && num === "alterno")
+    campos.push({ c: "No. factura", st: "ok", nota: `el comprobante no tiene ID fiscal; el número preimpreso del recibo coincide con SAP (${l.numero})` });
+  else if (!f.numero && !f.clave) {
+    const fh = idFechaHora(l.numero, f);
+    campos.push({ c: "No. factura", st: "na", nota: `el comprobante no tiene ID fiscal; no se compara el número${fh ? ` · el ID de SAP (${l.numero}) ${fh}` : ` (SAP: ${l.numero})`}` });
+  } else
   campos.push({ c: "No. factura",
-    st: num === "exacto" || num === "parcial" ? "ok" : num === "alterno" ? "warn" : (montoOk && simP >= 0.8) || (sinNumeroVisible && montoOk) ? "warn" : "error",
+    st: num === "exacto" || num === "parcial" ? "ok" : num === "alterno" ? "warn" : (montoOk && simP >= 0.8) ? "warn" : "error",
     nota: num === "parcial" ? "coincide parcialmente" : num === "alterno" ? `SAP registró un número secundario del comprobante (tiquete/orden), no el número fiscal ${f.numero || ""}`.trim()
-      : num ? "" : sinNumeroVisible ? "el número no es visible en el comprobante; emparejado por monto, proveedor y fecha"
-      : `número distinto (${f.numero || "sin número"} vs ${l.numero})${montoOk && simP >= 0.8 ? "; emparejado por monto y proveedor" : ""}` });
+      : num ? "" : `número distinto (${f.numero || "sin número"} vs ${l.numero})${montoOk && simP >= 0.8 ? "; emparejado por monto y proveedor" : ""}` });
   // Total (sin propina)
   if (l.solo_propina) campos.push({ c: "Total", st: "error", nota: "En SAP solo se registró la propina, sin la línea de la factura" });
+  else if (!(f.total > 0))
+    campos.push({ c: "Total", st: "warn", nota: "no se pudo leer el monto del comprobante (la lectura dio 0); revisa la imagen o corrige el total en la tabla de datos leídos" });
   else {
     let r = compararImporte(f.total, f.moneda, l, "monto");
+    if (r.st === "error" && f.total_pagado && Math.abs((f.total_pagado || 0) - (f.total || 0)) > 0.01 && !(f.propina > 0)) {
+      const rp = compararImporte(f.total_pagado, f.moneda, l, "monto");
+      if (rp.st === "ok" || rp.st === "warn") r = { st: "warn", nota: `Coincide con el monto total pagado (${mm(f.moneda || S.monedaLocal, f.total_pagado)}); la lectura tomó ${mm(f.moneda || S.monedaLocal, f.total)} como total. Corrige el total en la tabla de datos leídos` };
+    }
     if (r.st === "error" && f.impuesto > 0) {
       const r3 = compararImporte((f.total || 0) + f.impuesto, f.moneda, l, "monto");
       if (r3.st === "ok" || r3.st === "warn") r = { st: "warn", nota: `Coincide sumando el IVA (${money(f.impuesto)}): la lectura tomó el subtotal; corrige el total en la tabla de datos leídos` };
     }
     if (r.st === "error" && f.propina) {
       const r2 = compararImporte((f.total || 0) + f.propina, f.moneda, l, "monto");
-      if (r2.st === "ok" || r2.st === "warn") r = { st: "warn", nota: "El importe en SAP incluye la propina; debería registrarse aparte (-P). " + r2.nota };
+      if (r2.st === "ok" || r2.st === "warn") r = { st: "warn", propinaIncluida: true, nota: `coincide con factura + propina (${mm(f.moneda || S.monedaLocal, (f.total || 0) + f.propina)}): el importe de SAP incluye la propina${r2.nota ? "; " + r2.nota : ""}` };
     }
-    campos.push({ c: "Total", st: r.st, nota: r.nota });
+    campos.push({ c: "Total", st: r.st, nota: r.nota, propinaIncluida: !!r.propinaIncluida });
   }
   // Propina
   const fP = f.propina || 0, eP = l.propina || 0;
-  if (eP > 0 && fP <= 0) campos.push({ c: "Propina", st: "error", nota: `Propina de ${money(eP)} registrada sin respaldo en la factura` });
+  const propinaEnTotal = campos.some(k => k.c === "Total" && k.propinaIncluida);
+  if (propinaEnTotal && eP <= 0) campos.push(avisoPropinaIncluida(f, l));
+  else if (eP > 0 && fP <= 0) campos.push({ c: "Propina", st: "error", nota: `Propina de ${money(eP)} registrada sin respaldo en la factura` });
   else if (eP > 0) { const r = compararImporte(fP, f.moneda, l, "propina"); campos.push({ c: "Propina", st: r.st, nota: r.nota }); }
   else if (fP > 0) campos.push({ c: "Propina", st: "na", nota: `La factura trae propina de ${mm(m, fP)} que no se reclamó` });
   if (eP > 0 && l.monto) {
@@ -1298,27 +1731,73 @@ function evaluarPar(f, l, num) {
   if (!f.fecha) campos.push({ c: "Fecha", st: "warn", nota: "Factura sin fecha legible" });
   else if (!l.fecha_gasto) campos.push({ c: "Fecha", st: "na", nota: "La línea de SAP no tiene fecha de gasto" });
   else {
+    const tol = g.tol_fecha_dias ?? 1;
     const d = Math.abs(difDiasFirmado(f.fecha, l.fecha_gasto));
-    campos.push({ c: "Fecha", st: d === 0 ? "ok" : d <= (g.tol_fecha_dias ?? 1) ? "warn" : "error",
-      nota: d === 0 ? "" : `factura ${f.fecha} vs gasto ${l.fecha_gasto} (${d} día${d === 1 ? "" : "s"})` });
+    const inv = fechaInvertida(f.fecha), dInv = inv ? Math.abs(difDiasFirmado(inv, l.fecha_gasto)) : null;
+    const incierta = fechaIncierta(f), tipoF = f.fecha_manuscrita ? "manuscrita" : "poco legible";
+    if (d > tol && dInv !== null && dInv <= tol)
+      campos.push({ c: "Fecha", st: dInv === 0 ? "ok" : "warn", nota: `fecha en formato EE.UU. (MM/DD): ${fFecha(inv)} = gasto ${fFecha(l.fecha_gasto)}` });
+    else if (incierta && d > 0 && mismoDiaMes(f.fecha, l.fecha_gasto))
+      campos.push({ c: "Fecha", st: "ok", nota: `fecha ${tipoF}: día y mes coinciden con el gasto ${fFecha(l.fecha_gasto)}; el año se leyó ${f.fecha.slice(0, 4)} (lectura dudosa)` });
+    else if (incierta && d > tol)
+      campos.push({ c: "Fecha", st: "warn", nota: `fecha ${tipoF}, verificar en la imagen: se leyó ${fFecha(f.fecha)} vs gasto ${fFecha(l.fecha_gasto)}` });
+    else
+      campos.push({ c: "Fecha", st: d === 0 ? "ok" : d <= tol ? "warn" : "error",
+        nota: d === 0 ? "" : `factura ${fFecha(f.fecha)} vs gasto ${fFecha(l.fecha_gasto)} (${d} día${d === 1 ? "" : "s"})` });
   }
-  // Proveedor
-  const sim = simNombre(f.proveedor, l.proveedor);
-  if (sim !== null) campos.push({ c: "Proveedor", st: sim >= 0.8 ? "ok" : sim >= 0.4 ? "warn" : "error", nota: sim < 0.8 ? `similitud ${Math.round(sim * 100)} %` : "" });
+  // Proveedor (razón social o nombre comercial)
+  const sim = simProveedor(f, l.proveedor);
+  if (sim !== null) {
+    let stP = sim >= 0.8 ? "ok" : sim >= 0.4 ? "warn" : "error";
+    let notaP = sim < 0.8 ? `similitud ${Math.round(sim * 100)} %` : "";
+    // Si número y monto coinciden, un nombre distinto suele ser el nombre comercial: advertir, no rechazar
+    const montoCoincide = compararImporte(f.total, f.moneda, l, "monto").st === "ok";
+    if (stP === "error" && (num === "exacto" || num === "parcial") && montoCoincide) {
+      stP = "warn";
+      notaP = `la razón social de SAP ("${l.proveedor}") no aparece en la lectura ("${[f.proveedor, f.nombre_comercial].filter(Boolean).join(" / ")}"), pero número y monto coinciden; verificar`;
+    }
+    campos.push({ c: "Proveedor", st: stP, nota: notaP });
+  }
   // Receptor: "BTICINO CR" = "Bticino Costa Rica S.A" (se ignoran país, código de país y forma societaria)
-  if (f.receptor && S.cab?.empresa && !receptorEsEmpresa(f.receptor, S.cab.empresa))
+  const receptorGenerico = /^(cliente general|consumidor final|cf|c f|publico general|cliente|contado|varios|ticket|n a)$/.test(normTxt(f.receptor));
+  if (f.receptor && receptorGenerico)
+    campos.push({ c: "Receptor", st: "na", nota: `sin nombre de cliente ("${f.receptor}"); solo informativo` });
+  else if (f.receptor && S.cab?.empresa && !receptorEsEmpresa(f.receptor, S.cab.empresa) && !((simNombre(f.receptor, S.cab.empleado || "") ?? 0) >= 0.5))
     campos.push({ c: "Receptor", st: "warn", nota: `Factura a nombre de "${f.receptor}", no de la empresa` });
+  // Tipo de gasto de SAP vs comprobante
+  const tg = evaluarTipoGasto(f, l);
+  if (tg) campos.push(tg);
+  // Fecha de inicio / fin de SAP (hospedaje, alquiler de auto…)
+  if (l.fecha_inicio || l.fecha_fin) {
+    const ini = l.fecha_inicio || l.fecha_fin, fin = l.fecha_fin || l.fecha_inicio, tolR = g.tol_rango_dias ?? 1;
+    const rango = `${fFecha(ini)} – ${fFecha(fin)}`;
+    if (f.fecha) {
+      const dentro = x => difDiasFirmado(ini, x) >= -tolR && difDiasFirmado(x, fin) >= -tolR;
+      const fe = fechaEfectiva(f, l), inv = fechaInvertida(fe);
+      campos.push(dentro(fe) ? { c: "Período", st: "ok", nota: `dentro de ${rango}` }
+        : inv && dentro(inv) ? { c: "Período", st: "warn", nota: `dentro de ${rango} solo leyendo la fecha en formato MM/DD` }
+        : { c: "Período", st: fechaIncierta(f) ? "warn" : "error", nota: `comprobante del ${fFecha(fe)} fuera del período de SAP ${rango}${fechaIncierta(f) ? " (fecha manuscrita o poco legible: verificar)" : ""}` });
+    }
+    if (l.fecha_gasto && (difDiasFirmado(ini, l.fecha_gasto) < -tolR || difDiasFirmado(l.fecha_gasto, fin) < -tolR))
+      campos.push({ c: "Datos SAP", st: "warn", nota: `la Fecha de gasto (${fFecha(l.fecha_gasto)}) está fuera del rango inicio–fin (${rango})` });
+    if (f.categoria === "hospedaje" || /hospedaje|alojamiento/.test(normTxt(l.tipo_gasto + " " + l.categoria_gasto))) {
+      const nochesSap = Math.max(1, difDiasFirmado(ini, fin) || 0);
+      f._nochesSap = nochesSap;
+      // El rango de SAP puede cubrir varios hoteles del viaje: solo se marca si la factura tiene MÁS noches que el rango
+      if (f.noches && f.noches > nochesSap) campos.push({ c: "Noches", st: "warn", nota: `la factura indica ${f.noches} noche(s) y el rango de SAP solo ${nochesSap}` });
+    }
+  }
   // Visibilidad y validez fiscal
   if (f.visibilidad && f.visibilidad !== "completa")
     campos.push({ c: "Visibilidad", st: "warn", nota: `comprobante ${f.visibilidad === "ilegible" ? "casi ilegible" : "no 100 % visible"}${f.no_visibles?.length ? ": no se ve " + f.no_visibles.join(", ") : ""}; verificar contra el documento` });
   if (f.es_fiscal === false)
-    campos.push({ c: "Documento", st: "warn", nota: `no es un comprobante fiscal (${f.tipo_documento || "pedido / voucher / recibo"})` });
+    campos.push({ c: "Documento", st: "na", nota: `no es un comprobante fiscal (${f.tipo_documento || "pedido / voucher / recibo"}); solo informativo` });
   // Calidad de lectura
   if (!f.legible && f.visibilidad === "completa") notas.push("Comprobante marcado como ilegible: verificar contra el documento.");
   else if (f.confianza !== null && f.confianza < g.confianza_minima && !f.editada) notas.push(`Lectura con confianza baja (${Math.round(f.confianza * 100)} %): verificar manualmente.`);
   if (f.observaciones) notas.push("IA: " + f.observaciones);
   if (/credito/.test(normTxt(f.tipo_documento))) notas.push("El documento es una nota de crédito.");
-  if (/recibo/.test(normTxt(f.tipo_documento))) notas.push("Es un recibo, no una factura electrónica.");
+  if (/recibo/.test(normTxt(f.tipo_documento)) && f.es_fiscal !== false) notas.push("Es un recibo, no una factura electrónica (solo informativo).");
   return { campos, notas };
 }
 function nucleoEmpresa(txt) {
@@ -1330,19 +1809,58 @@ function nucleoEmpresa(txt) {
   return t.replace(/\s+/g, " ").trim();
 }
 function receptorEsEmpresa(receptor, empresa) {
+  const r = normTxt(receptor);
+  if ((C.NOMBRES_GRUPO || []).some(n => n && new RegExp(`\\b${normTxt(n)}\\b`).test(r))) return true;   // Legrand, Bticino…
   const a = nucleoEmpresa(receptor), b = nucleoEmpresa(empresa);
   if (!a || !b) return true;
   const sa = a.replace(/ /g, ""), sb = b.replace(/ /g, "");
   return sa.includes(sb) || sb.includes(sa) || (simNombre(a, b) ?? 1) >= 0.5;
 }
+/** Similitud del proveedor de SAP con la razón social o el nombre comercial del comprobante (la mayor) */
+function simProveedor(f, nombreSap) {
+  const a = simNombre(f.proveedor, nombreSap), b = f.nombre_comercial ? simNombre(f.nombre_comercial, nombreSap) : null;
+  return a === null && b === null ? null : Math.max(a ?? 0, b ?? 0);
+}
 const RANGO = { ok: 0, na: 0, warn: 1, error: 2 };
+/** IDs de SAP armados con fecha+hora del comprobante (ej. 100226-0234 = 10/02/26 2:34): ¿coinciden? */
+function idFechaHora(id, f) {
+  const m = /^(\d{6})[\s_-]?(\d{3,4})$/.exec(String(id || "").replace(/[:.]/g, ""));
+  if (!m) return "";
+  const [a, b, c] = [m[1].slice(0, 2), m[1].slice(2, 4), m[1].slice(4, 6)];
+  const hhmm = m[2].padStart(4, "0"), h = +hhmm.slice(0, 2), mi = hhmm.slice(2);
+  const fechas = [`20${c}-${a}-${b}`, `20${c}-${b}-${a}`, `20${a}-${b}-${c}`];   // MMDDYY, DDMMYY, YYMMDD
+  const okFecha = f.fecha && fechas.some(x => x === f.fecha || x === fechaInvertida(f.fecha));
+  let okHora = null;
+  if (f.hora) { const [fh, fm] = f.hora.split(":").map(Number); okHora = fm === +mi && (fh === h || fh % 12 === h % 12); }
+  if (okFecha && okHora !== false) return `coincide con la fecha${okHora ? " y hora" : ""} del comprobante`;
+  if (okFecha === false && f.fecha) return `parece fecha+hora pero no coincide con el comprobante (${fFecha(f.fecha)}${f.hora ? " " + f.hora : ""})`;
+  return "";
+}
+const NOMBRE_CAT = { alimentacion: "alimentación", hospedaje: "hospedaje", transporte: "transporte", combustible: "combustible", parqueo: "parqueo/peaje", otros: "otros" };
+function reglaTipo(tipo) { const t = normTxt(tipo); return t ? (C.REGLAS_TIPO_GASTO || []).find(r => t.includes(normTxt(r.contiene))) || null : null; }
+function regimenDeTipo(tipo) {
+  const r = reglaTipo(tipo); if (r?.regimen) return r.regimen;
+  const t = normTxt(tipo);
+  for (const [suf, reg] of Object.entries(C.SUFIJO_REGIMEN || {})) if (new RegExp(`\\b${suf}\\b`).test(t)) return reg;
+  return null;
+}
+function evaluarTipoGasto(f, l) {
+  if (!l.tipo_gasto) return null;
+  const regla = reglaTipo(l.tipo_gasto);
+  const notas = [];
+  let st = "ok";
+  if (regla && f.categoria && !regla.categorias.includes(f.categoria)) {
+    st = "warn"; notas.push(`el comprobante es de ${NOMBRE_CAT[f.categoria] || f.categoria}`);
+  }
+  return { c: "Tipo de gasto", st, nota: st === "ok" ? l.tipo_gasto : `"${l.tipo_gasto}": ${notas.join("; ")}` };
+}
 function ajustar(x, st) { (x.ajustes ||= []).push(st); x.estado = peor([x.estado, st]); }
 const CAMPOS_PROPINA = ["Propina", "Propina %", "IVA propina"];
 /**
  * Vista "una fila por línea de SAP": cada comprobante emparejado da su fila principal y una fila
  * por cada línea de propina (-P, -A…), todas en el orden del ID de gastos de SAP.
  */
-function filasVista(R) {
+function filasVista(R, opciones = {}) {
   const filas = [];
   R.resultados.forEach(x => {
     const l = x.linea, propinas = l?.propinas || [];
@@ -1350,7 +1868,7 @@ function filasVista(R) {
     const camposProp = (x.campos || []).filter(c => CAMPOS_PROPINA.includes(c.c));
     if (!l || !l.solo_propina) {
       const estado = x.tipo === "par" ? peor([...camposFact.map(c => c.st), ...(x.ajustes || [])]) : x.estado;
-      filas.push({ tipo: "principal", x, id: l ? l.id_gasto : null, estado, campos: x.tipo === "par" && propinas.length ? camposFact : (x.campos || []), notas: x.notas || [] });
+      filas.push({ tipo: "principal", clave: "p:" + (l ? l.id : "f:" + x.factura?.id), x, id: l ? l.id_gasto : null, estado, campos: x.tipo === "par" && propinas.length ? camposFact : (x.campos || []), notas: x.notas || [] });
     }
     propinas.forEach(t => {
       let estado, campos = camposProp, notas = [];
@@ -1360,12 +1878,19 @@ function filasVista(R) {
         estado = peor(camposProp.map(c => c.st));
         if (estado === "ok") campos = camposProp.map(c => c.c === "Propina" && !c.nota ? { ...c, nota: "respaldada por el comprobante" } : c);
       }
-      filas.push({ tipo: "propina", x, tip: t, id: t.id_gasto, estado, campos, notas });
+      filas.push({ tipo: "propina", clave: `t:${l.id}:${t.id_gasto}:${t.fila}`, x, tip: t, id: t.id_gasto, estado, campos, notas });
     });
     if (l && !propinas.length && (l.filas_propina || []).length) { /* revisiones antiguas sin detalle de propina: se muestran agrupadas */ }
   });
+  // Decisiones manuales del revisor
+  const manual = R.manual || {}, elim = R.eliminadas || {};
+  filas.forEach(v => {
+    v.estadoOriginal = v.estado;
+    if (manual[v.clave]) { v.manual = manual[v.clave]; v.estado = "ok"; }
+    if (elim[v.clave]) v.eliminada = elim[v.clave];
+  });
   const ordenF = new Map(R.resultados.map((x, i) => [x, i]));
-  return filas.sort((a, b) => (a.id !== null && b.id !== null) ? (numGasto(a.id) - numGasto(b.id) || String(a.id).localeCompare(String(b.id)) || (a.tipo === "propina") - (b.tipo === "propina"))
+  return filas.filter(v => opciones.incluirEliminadas || !v.eliminada).sort((a, b) => (a.id !== null && b.id !== null) ? (numGasto(a.id) - numGasto(b.id) || String(a.id).localeCompare(String(b.id)) || (a.tipo === "propina") - (b.tipo === "propina"))
     : a.id !== null ? -1 : b.id !== null ? 1 : ordenF.get(a.x) - ordenF.get(b.x));
 }
 const peor = arr => arr.reduce((a, b) => (RANGO[b] > RANGO[a] ? b : a), "ok");
@@ -1374,6 +1899,8 @@ const peor = arr => arr.reduce((a, b) => (RANGO[b] > RANGO[a] ? b : a), "ok");
 function regimenDe(f) {
   const r = f.regimen && f.regimen !== "auto" ? f.regimen : S.regimen;
   if (r !== "auto") return r;
+  const deSap = f._tipoGasto ? regimenDeTipo(f._tipoGasto) : null;   // el tipo de gasto de SAP manda
+  if (deSap) return deSap;
   const pf = normPais(f.pais);
   if (!pf || pf === normPais(S.paisEmpresa)) return G().nacional_por_defecto;
   return "viaje";
@@ -1417,16 +1944,19 @@ function evaluarLimites(facturas) {
     const pers = g.por_persona ? Math.max(1, +f.personas || 1) : 1;
     const notasP = pers > 1 ? [`${etiqueta(f)}: ${pers} personas, límite por persona`] : [];
     if (f.categoria === "hospedaje") {
-      const noches = Math.max(1, +f.noches || 1);
+      const noches = Math.max(1, +f.noches || +f._nochesSap || 1);
       let lim = N.gira_hospedaje_noche, region = "";
       if (reg === "viaje") {
         const r = regionDe(P().viajes_hospedaje, f.pais);
         if (!r) { sinRegion(f, reg, "Hospedaje"); continue; }
         lim = { monto: r.monto, moneda: r.moneda, incluye: false }; region = r.region;
       }
-      const { neto, notas } = netoFactura(f, lim.incluye);
+      const { neto: netoH, notas } = netoFactura(f, lim.incluye);
+      const otros = f.otros_cargos > 0 && f.otros_cargos < netoH ? f.otros_cargos : 0;
+      if (otros) notas.push(`se excluyeron ${mm(mon, otros)} de otros cargos del folio${f.otros_cargos_detalle ? ` (${f.otros_cargos_detalle})` : ""}`);
+      const neto = netoH - otros;
       cerrar({ fecha: f.fecha, regimen: reg, concepto: `Hospedaje por noche${noches > 1 ? ` (${noches} noches)` : ""}`, region, ids: [f.id], etiquetas: [etiqueta(f)],
-        monto: convertir(neto / noches, mon, lim.moneda), limite: lim.monto, moneda: lim.moneda, notas: [...notas, ...(f.noches ? [] : ["sin dato de noches: se asumió 1"])] });
+        monto: convertir(neto / noches, mon, lim.moneda), limite: lim.monto, moneda: lim.moneda, notas: [...notas, ...(f.noches ? [] : f._nochesSap ? [`noches según el rango de SAP: ${f._nochesSap}`] : ["sin dato de noches: se asumió 1"])] });
       continue;
     }
     // Alimentación
@@ -1458,8 +1988,116 @@ function evaluarLimites(facturas) {
   return checks;
 }
 
+/**
+ * Comprobantes "fragmento": segunda página de un recibo (ej. Uber: mapa y conductor) que la lectura devolvió como
+ * comprobante sin fecha ni número. Se unen al comprobante del mismo proveedor de la página anterior del mismo archivo.
+ */
+function marcarFragmentos(facturas) {
+  facturas.forEach(f => { delete f.fragmentoDe; });
+  facturas.forEach(f => {
+    if (f.editada || f.fecha || f.numero || f.clave || !f.pagina) return;
+    const previas = facturas.filter(p => p !== f && !p.fragmentoDe && p.origen === f.origen && p.pagina === f.pagina - 1)
+      .sort((a, b) => (b.orden ?? 0) - (a.orden ?? 0));
+    // La unión queda fija la primera vez (f.unidoA), para que al volver a comparar no se separe
+    const prev = (f.unidoA && previas.find(p => p.id === f.unidoA))
+      || previas.find(p => (simNombre(p.proveedor, f.proveedor) ?? 0) >= 0.8)
+      // la IA marcó la página como continuación, o a la única de la página anterior le falta el monto (el total quedó aquí)
+      || (previas.length && (f.esContinuacion || (previas.length === 1 && !(previas[0].total > 0) && f.total > 0)) ? previas[0] : null);
+    if (prev) {
+      f.fragmentoDe = prev.id; f.unidoA = prev.id;
+      if (!prev.hora && f.hora) prev.hora = f.hora;
+      if (!(prev.total > 0) && f.total > 0 && !prev.editada) {
+        ["total", "total_pagado", "propina", "impuesto", "otros_cargos"].forEach(k => { if (f[k] > 0 && !(prev[k] > 0)) prev[k] = f[k]; });
+        if (!prev.moneda && f.moneda) prev.moneda = f.moneda;
+        prev.observaciones = [prev.observaciones, `Monto tomado de la página ${f.pagina} (continuación)`].filter(Boolean).join(" · ");
+      }
+    }
+  });
+  return facturas.filter(f => !f.fragmentoDe);
+}
+/** Descriptor de tarjeta vs proveedor: una palabra distintiva del proveedor dentro del descriptor pegado (ej. "toll" en "ERACTOLL") */
+const PALABRAS_GENERICAS = new Set(["sociedad", "anonima", "limitada", "ltda", "llc", "inc", "corp", "company", "group", "grupo", "hotel", "hoteles", "restaurante",
+  "restaurant", "servicios", "service", "services", "administration", "comercial", "internacional", "international", "guatemala", "salvador", "costa", "rica",
+  "panama", "honduras", "nicaragua", "mexico", "the", "and", "del", "los", "las", "city", "centro", "plaza"]);
+function simDescriptor(desc, nombre) {
+  const d = normTxt(desc).replace(/[^a-z0-9]/g, "");
+  if (!d || !nombre) return 0;
+  const pal = normTxt(nombre).split(/[^a-z0-9]+/).filter(w => w.length >= 4 && !PALABRAS_GENERICAS.has(w) && !/^\d+$/.test(w));
+  return pal.some(w => d.includes(w)) ? 0.5 : 0;
+}
+function emparejarMovimientos(res, movs) {
+  const lista = (movs || []).map(m => ({ ...m, match: null }));
+  if (!lista.length) return lista;
+  const tol = 0.02, local = S.monedaLocal;
+  const cand = [];
+  lista.forEach((m, i) => res.forEach((x, j) => {
+    const l = x.linea, f = x.factura;
+    if (!l && !f) return;
+    let s = 0, como = "";
+    const montos = l ? [l.monto, (l.monto || 0) + (l.propina || 0)] : [];
+    const montosLoc = l ? [l.monto_local, (l.monto_local || 0) + (l.propina_local || 0)] : [];
+    if (l && montos.some(v => v !== null && Math.abs(v - m.monto) <= tol)) { s += 40; como = "sap"; }
+    else if (l && m.moneda === local && montosLoc.some(v => v !== null && Math.abs(v - m.monto) <= tol)) { s += 40; como = "sap"; }
+    else if (f && (f.moneda || local) === m.moneda && [f.total, (f.total || 0) + (f.propina || 0), f.total_pagado].some(v => v !== null && v !== undefined && Math.abs(v - m.monto) <= tol)) { s += 32; como = "factura"; }
+    else return;
+    const fechaRef = l?.fecha_gasto || f?.fecha;
+    const d = m.fecha && fechaRef ? Math.abs(difDiasFirmado(m.fecha, fechaRef)) : null;
+    if (d === 0) s += 15; else if (d !== null && d <= 3) s += 10; else if (d !== null && d > 10) s -= 20;
+    const com = m.comercio.replace(/\\/g, " ");
+    const sim = Math.max(simNombre(com, l?.proveedor || "") ?? 0, simNombre(com, f?.proveedor || "") ?? 0, simNombre(com, f?.nombre_comercial || "") ?? 0,
+      simDescriptor(com, l?.proveedor), simDescriptor(com, f?.proveedor), simDescriptor(com, f?.nombre_comercial));
+    s += 12 * sim;
+    if (sim < 0.25) s -= 8;   // comercio distinto: solo se acepta si monto y fecha coinciden exacto, y queda como advertencia
+    if (s >= 45) cand.push({ i, j, s, como, d, sim });
+  }));
+  cand.sort((a, b) => b.s - a.s);
+  const usadosM = new Set(), usadosR = new Set();
+  for (const c of cand) {
+    if (usadosM.has(c.i) || usadosR.has(c.j)) continue;
+    usadosM.add(c.i); usadosR.add(c.j);
+    const m = lista[c.i], x = res[c.j];
+    m.match = { id_gasto: x.linea?.id_gasto ?? null, numero: x.linea?.numero || x.factura?.numero || "" };
+    x.movimiento = m;
+    const desc = `cargo ${fFecha(m.fecha)} ${m.comercio.replace(/\\/g, " ").replace(/\s+/g, " ").trim()} ${mm(m.moneda, m.monto)}`;
+    const debil = c.sim < 0.25;
+    if (x.tipo === "par" && debil) {
+      x.campos.push({ c: "Estado de cuenta", st: "warn", nota: `${desc}: monto y fecha coinciden, pero el comercio no se parece al proveedor; verificar que sea este gasto` });
+      x.estado = peor([...x.campos.map(k => k.st), ...(x.ajustes || [])]);
+    } else if (x.tipo === "par") {
+      x.campos.push({ c: "Estado de cuenta", st: "ok", nota: desc });
+      // SAP registró la fecha del cargo en tarjeta y no la del servicio (peajes, alquileres cobrados después)
+      const fch = x.campos.find(k => k.c === "Fecha");
+      if (fch?.st === "error" && m.fecha && x.linea?.fecha_gasto && Math.abs(difDiasFirmado(m.fecha, x.linea.fecha_gasto)) <= 1) {
+        fch.st = "warn";
+        fch.nota = `la Fecha de gasto de SAP (${fFecha(x.linea.fecha_gasto)}) es la del cargo en tarjeta; el comprobante es del ${fFecha(x.factura.fecha)}`;
+      }
+      // El cargo confirma el monto registrado en SAP: resuelve diferencias de tipo de cambio
+      const tot = x.campos.find(k => k.c === "Total");
+      if (tot && tot.st !== "ok" && c.como === "sap") {
+        if (tot.propinaIncluida) {
+          // El cargo confirma el monto cobrado, pero el registro sigue mal: la propina debe ir en su propia línea
+          tot.st = "warn";
+          tot.nota = `el cargo del estado de cuenta (${mm(m.moneda, m.monto)}) confirma lo cobrado, que incluye la propina (${mm(x.factura.moneda || S.monedaLocal, x.factura.propina)}); ver Propina`;
+        } else {
+          tot.st = "ok"; tot.nota = `validado con el estado de cuenta (${mm(m.moneda, m.monto)})${tot.nota ? "; antes: " + tot.nota : ""}`;
+        }
+      }
+      x.estado = peor([...x.campos.map(k => k.st), ...(x.ajustes || [])]);
+    } else if (x.tipo === "linea_sola" && debil) {
+      x.notas.push(`Posible cargo en el estado de cuenta con el mismo monto y fecha, pero de otro comercio: ${desc}.`);
+    } else if (x.tipo === "linea_sola") {
+      x.estado = "warn";
+      x.campos = [{ c: "Estado de cuenta", st: "warn", nota: `sin factura: el gasto solo está respaldado por el ${desc}` }];
+      x.notas = ["Línea de SAP sin comprobante fiscal; existe el cargo en el estado de cuenta."];
+    } else if (x.tipo === "factura_sola") {
+      x.notas.push(`El comprobante aparece en el estado de cuenta: ${desc}.`);
+    }
+  }
+  return lista;
+}
 function comparar() {
-  const lineas = S.lineas, facturas = S.facturas;
+  const lineas = S.lineas, facturas = marcarFragmentos(S.facturas);
+  facturas.forEach(f => { delete f._tipoGasto; delete f._nochesSap; delete f._fechaLinea; });
   const pares = [];
   facturas.forEach((f, i) => lineas.forEach((l, j) => { const p = puntaje(f, l); if (p.s >= 32) pares.push({ i, j, ...p }); }));
   pares.sort((a, b) => b.s - a.s);
@@ -1472,7 +2110,7 @@ function comparar() {
     let st = peor(campos.map(c => c.st));
     const ajustes = notas.some(n => /ilegible|confianza baja/.test(n)) ? ["warn"] : [];
     st = peor([st, ...ajustes]);
-    f._fechaLinea = l.fecha_gasto;
+    f._fechaLinea = l.fecha_gasto; f._tipoGasto = l.tipo_gasto;
     res.push({ tipo: "par", estado: st, factura: f, linea: l, campos, notas, ajustes, puntaje: Math.round(p.s) });
   }
   facturas.forEach((f, i) => { if (!usadasF.has(i)) res.push({ tipo: "factura_sola", estado: "error", factura: f, linea: null, campos: [], notas: ["Comprobante sin línea correspondiente en el informe de SAP."]
@@ -1485,22 +2123,47 @@ function comparar() {
   const dupF = cuenta(facturas, claveF), dupL = cuenta(lineas, l => soloDigitos(l.numero) || null);
   res.forEach(x => {
     const kf = x.factura && claveF(x.factura);
-    if (kf && dupF[kf] > 1) { x.notas.push("Comprobante duplicado: el mismo número aparece más de una vez en los archivos."); ajustar(x, "warn"); }
+    if (kf && dupF[kf] > 1) { x.campos.push({ c: "Duplicado", st: "warn", nota: "el mismo número de comprobante aparece más de una vez en los archivos" }); ajustar(x, "warn"); }
     const kl = x.linea && soloDigitos(x.linea.numero);
-    if (kl && dupL[kl] > 1) { x.notas.push("ID de factura repetido en el informe de SAP."); ajustar(x, "error"); }
+    if (kl && dupL[kl] > 1) { x.campos.push({ c: "Duplicado", st: "error", nota: "ID de factura repetido en el informe de SAP" }); ajustar(x, "error"); }
   });
+  // Período del informe: comprobantes dentro del rango de estadías declarado en SAP (solo advertencia)
+  if (G().validar_periodo_informe !== false) {
+    const inis = lineas.map(l => l.fecha_inicio).filter(Boolean).sort(), fins = lineas.map(l => l.fecha_fin).filter(Boolean).sort();
+    if (inis.length && fins.length) {
+      const pIni = inis[0], pFin = fins[fins.length - 1], tolR = (G().tol_rango_dias ?? 1) + 1;
+      res.forEach(x => {
+        const f = x.factura;
+        if (!f?.fecha || (x.linea && (x.linea.fecha_inicio || x.linea.fecha_fin))) return;
+        const fe = fechaEfectiva(f, x.linea);
+        const fuera = difDiasFirmado(pIni, fe) < -tolR || difDiasFirmado(fe, pFin) < -tolR;
+        const inv = fechaInvertida(fe), okInv = inv && !(difDiasFirmado(pIni, inv) < -tolR || difDiasFirmado(inv, pFin) < -tolR);
+        if (fuera && !okInv) { x.campos.push({ c: "Período del viaje", st: "warn", nota: `comprobante del ${fFecha(fe)} fuera del período de estadías del informe (${fFecha(pIni)} – ${fFecha(pFin)})` }); ajustar(x, "warn"); }
+      });
+    }
+  }
+  // Movimientos de estado de cuenta: evidencia de cargo, no comprobantes
+  const movimientos = emparejarMovimientos(res, S.movimientos);
   // Límites
   const limites = evaluarLimites(facturas);
   const porFactura = {};
   limites.forEach(c => c.ids.forEach(id => (porFactura[id] ||= []).push(c)));
   res.forEach(x => {
     if (!x.factura) return;
-    (porFactura[x.factura.id] || []).filter(c => c.st !== "ok").forEach(c => {
-      x.notas.push(c.st === "error"
-        ? `Excede límite "${c.concepto}"${c.region ? " · " + c.region : ""}${c.fecha ? " del " + c.fecha : ""}: ${mm(c.moneda, c.monto)} vs ${mm(c.moneda, c.limite)} (exceso ${mm(c.moneda, c.exceso)})`
-        : `Límite no evaluable: ${c.notas.join("; ")}`);
+    (porFactura[x.factura.id] || []).forEach(c => {
+      const extra = c.notas?.length ? ` · ${c.notas.join("; ")}` : "";
+      if (c.st === "ok") { if (c.notas?.some(n => /excluyeron/.test(n))) x.campos.push({ c: "Límite", st: "ok", nota: `${c.concepto}: ${mm(c.moneda, c.monto)} de ${mm(c.moneda, c.limite)}${extra}` }); return; }
+      x.campos.push(c.st === "error"
+        ? { c: "Límite", st: "error", nota: `excede "${c.concepto}"${c.region ? " · " + c.region : ""}${c.fecha ? " del " + fFecha(c.fecha) : ""}: ${mm(c.moneda, c.monto)} vs ${mm(c.moneda, c.limite)} (exceso ${mm(c.moneda, c.exceso)})${extra}` }
+        : { c: "Límite", st: "warn", nota: `no evaluable: ${c.notas.join("; ")}` });
       ajustar(x, c.st);
     });
+  });
+  // Observaciones de las reglas del equipo (revisión con IA), por ID de gasto
+  const obsR = S.obsReglas?.informe === S.cab?.informe ? S.obsReglas.porId : {};
+  res.forEach(x => {
+    const id = x.linea ? String(x.linea.id_gasto ?? "") : "";
+    (obsR[id] || []).forEach(o => { x.campos.push({ c: "💡 Regla del equipo", st: o.st, nota: o.nota, regla: true }); if (o.st === "warn") ajustar(x, "warn"); });
   });
   // Mismo orden que SAP: por ID de gastos; los comprobantes sin línea van al final en el orden en que se leyeron
   const ordenF = new Map(facturas.map((f, i) => [f.id, i]));
@@ -1509,15 +2172,22 @@ function comparar() {
   const local = S.monedaLocal;
   const totFactLocal = facturas.reduce((s, f) => { const v = convertir((f.total || 0) + (f.propina || 0), f.moneda || local, local); return v === null ? s : s + v; }, 0);
   const totSap = lineas.reduce((s, l) => s + (l.monto_local || 0) + (l.propina_local || 0), 0);
-  return { resultados: res, limites, cab: clonar(S.cab), monedaLocal: local, paisEmpresa: S.paisEmpresa, regimen: S.regimen,
+  return { resultados: res, limites, movimientos, cab: clonar(S.cab), monedaLocal: local, paisEmpresa: S.paisEmpresa, regimen: S.regimen,
     totalFacturas: facturas.length, totalLineas: lineas.reduce((n, l) => n + (l.filas?.length || 0) + (l.filas_propina?.length || 0), 0), totFactLocal, totSap };
 }
 
 $("#bComparar").addEventListener("click", () => {
+  const previo = S.resultados || S._ultimo;
   S.resultados = comparar();
+  // Conservar aprobaciones y eliminaciones manuales si se vuelve a comparar el mismo informe
+  if (previo && previo.cab?.informe === S.resultados.cab?.informe) {
+    S.resultados.manual = previo.manual || {}; S.resultados.eliminadas = previo.eliminadas || {};
+    S.resultados._ui = { ...(previo._ui || {}), scroll: 0 };
+  }
   renderResultados($("#resultados"), S.resultados, { editable: true });
   $("#resultados").classList.remove("oculto");
   $("#resultados").scrollIntoView({ behavior: "smooth", block: "start" });
+  if (C.REGLAS_AUTOMATICAS && S.reglasRevision > 0 && S.obsReglas?.firma !== firmaRevision()) aplicarReglas(false);
 });
 
 /* =====================================================================
@@ -1528,8 +2198,12 @@ const TXT_ESTADO = { ok: "Coincide", warn: "Advertencia", error: "Discrepancia" 
 function conteos(R) { const c = { ok: 0, warn: 0, error: 0 }; filasVista(R).forEach(v => c[v.estado === "na" ? "ok" : v.estado]++); return c; }
 const nombreEstado = e => ({ aprobado: "Aprobado", con_observaciones: "Con observaciones", rechazado: "Rechazado" }[e] || e || "—");
 
-function renderResultados(cont, R, { editable = false, registro = null } = {}) {
+function renderResultados(cont, R, opts = {}) {
+  const { editable = false, registro = null } = opts;
   const vista = filasVista(R), c = conteos(R), lim = R.limites || [];
+  const eliminadas = filasVista(R, { incluirEliminadas: true }).filter(v => v.eliminada);
+  const nManual = vista.filter(v => v.manual).length;
+  const ui = R._ui || (R._ui = { filtro: "todos" });
   const exc = lim.filter(x => x.st === "error").length;
   const fid = "flt_" + uid(), ml = R.monedaLocal || "", cab = R.cab || {};
   cont.innerHTML = `
@@ -1550,19 +2224,36 @@ function renderResultados(cont, R, { editable = false, registro = null } = {}) {
       <div class="kpi"><div class="v" style="font-size:16px">${esc(mm(ml, R.totSap))}</div><div class="l">Informe SAP (${R.totalLineas} líneas) en moneda local</div></div>
     </div>
     <div class="filtros" id="${fid}">
-      <button class="btn chico activo" data-f="todos">Todos (${vista.length})</button>
-      <button class="btn chico" data-f="error">❌ Discrepancias (${c.error})</button>
-      <button class="btn chico" data-f="warn">⚠️ Advertencias (${c.warn})</button>
-      <button class="btn chico" data-f="ok">✅ Coinciden (${c.ok})</button>
+      <button class="btn chico ${ui.filtro === "todos" ? "activo" : ""}" data-f="todos">Todos (${vista.length})</button>
+      <button class="btn chico ${ui.filtro === "error" ? "activo" : ""}" data-f="error">❌ Discrepancias (${c.error})</button>
+      <button class="btn chico ${ui.filtro === "warn" ? "activo" : ""}" data-f="warn">⚠️ Advertencias (${c.warn})</button>
+      <button class="btn chico ${ui.filtro === "ok" ? "activo" : ""}" data-f="ok">✅ Coinciden (${c.ok})</button>
+      ${nManual ? `<span class="mini muted" style="align-self:center">${nManual} aprobada(s) manualmente</span>` : ""}
+      ${eliminadas.length ? `<span class="mini muted" style="align-self:center">· ${eliminadas.length} eliminada(s) de la revisión</span>` : ""}
     </div>
-    <div class="scroll" style="max-height:640px"><table>
-      <thead><tr><th>ID gasto</th><th></th><th>Línea SAP</th><th>Comprobante</th><th class="num">SAP</th><th class="num">Comprobante</th><th>Detalle</th></tr></thead>
-      <tbody>${vista.map(v => filaResultado(v, ml)).join("")}</tbody></table></div>
+    <div class="scroll" style="max-height:640px" data-scroll><table>
+      <thead><tr><th>ID gasto</th><th></th><th>Línea SAP</th><th>Comprobante</th><th class="num">SAP</th><th class="num">Comprobante</th><th>Detalle</th>${editable ? "<th>Revisión manual</th>" : ""}</tr></thead>
+      <tbody>${vista.map(v => filaResultado(v, ml, editable)).join("")}</tbody></table></div>
+    ${eliminadas.length ? `<details style="margin-top:10px" ${ui.verEliminadas ? "open" : ""} data-det-elim>
+      <summary>Líneas eliminadas de esta revisión (${eliminadas.length})</summary>
+      <div class="scroll" style="max-height:300px;margin-top:8px"><table><tbody>${eliminadas.map(v => `<tr>
+        <td><b>${esc(v.id ?? "—")}</b></td><td>${esc(v.tipo === "propina" ? v.tip.numero : v.x.linea?.numero || v.x.factura?.numero || "")}<div class="mini muted">${esc(v.x.linea?.proveedor || v.x.factura?.proveedor || "")}</div></td>
+        <td class="mini muted">Eliminada por ${esc(v.eliminada.por)} · ${new Date(v.eliminada.fecha).toLocaleString("es-CR")}${v.eliminada.motivo ? `<br>Motivo: ${esc(v.eliminada.motivo)}` : ""}</td>
+        <td>${editable ? `<button class="btn chico" data-restaurar="${esc(v.clave)}">Restaurar</button>` : ""}</td></tr>`).join("")}</tbody></table></div></details>` : ""}
+
+    ${(R.movimientos || []).length ? (() => {
+      const movs = R.movimientos, sin = movs.filter(m => !m.match);
+      return `<h3>💳 Movimientos del estado de cuenta</h3>
+      <p class="sub" style="margin-bottom:6px">${movs.length - sin.length} de ${movs.length} cargos emparejados con líneas del informe. Los no emparejados son solo informativos (no cuentan como discrepancias).</p>
+      ${sin.length ? `<details><summary>Cargos sin línea en SAP (${sin.length})</summary><div class="scroll" style="max-height:300px;margin-top:8px"><table>
+        <thead><tr><th>Fecha</th><th>Comercio</th><th>País</th><th class="num">Monto</th></tr></thead>
+        <tbody>${sin.map(m => `<tr><td class="mini">${esc(fFecha(m.fecha))}</td><td>${esc(m.comercio)}</td><td class="mini">${esc(m.pais)}</td><td class="num">${esc(mm(m.moneda, m.monto))}</td></tr>`).join("")}</tbody></table></div></details>` : ""}`;
+    })() : ""}
 
     <h3>Control de límites de política</h3>
     ${lim.length ? `<div class="scroll" style="max-height:420px"><table>
       <thead><tr><th></th><th>Fecha</th><th>Régimen</th><th>Concepto</th><th>Comprobantes</th><th class="num">Monto neto</th><th class="num">Límite</th><th class="num">Exceso</th><th>Notas</th></tr></thead>
-      <tbody>${lim.map(x => `<tr><td>${ICONO[x.st]}</td><td class="mini">${esc(x.fecha || "—")}</td><td class="mini">${esc(NOMBRE_REG[x.regimen] || x.regimen)}</td>
+      <tbody>${lim.map(x => `<tr><td>${ICONO[x.st]}</td><td class="mini">${esc(fFecha(x.fecha) || "—")}</td><td class="mini">${esc(NOMBRE_REG[x.regimen] || x.regimen)}</td>
         <td>${esc(x.concepto)}${x.region ? `<div class="mini muted">${esc(x.region)}</div>` : ""}</td>
         <td class="mini">${x.etiquetas.map(esc).join("<br>")}</td>
         <td class="num">${esc(mm(x.moneda, x.monto))}</td><td class="num">${esc(mm(x.moneda, x.limite))}</td>
@@ -1573,42 +2264,98 @@ function renderResultados(cont, R, { editable = false, registro = null } = {}) {
     ${editable ? `<div class="fila" style="margin-top:16px">
       <div class="campo" style="max-width:220px"><label>Dictamen</label>
         <select id="rEstado"><option value="aprobado">Aprobado</option><option value="con_observaciones">Con observaciones</option><option value="rechazado">Rechazado</option></select></div>
-      <div class="campo"><label>Comentario</label><input type="text" id="rComent" placeholder="Opcional: observaciones para el colaborador o contabilidad"></div>
-      <button class="btn primario" data-acc="guardar">Guardar en historial</button></div>` : ""}
+      <div class="campo"><label>Comentario</label><input type="text" id="rComent" value="${esc(ui.comentario || "")}" placeholder="Opcional: observaciones para el colaborador o contabilidad"></div>
+      <button class="btn primario" data-acc="guardar">Guardar en historial</button>
+      <button class="btn" data-acc="nueva" title="Borra el Excel, los comprobantes y los resultados para empezar otra revisión">↺ Nueva revisión</button></div>
+    <div class="sug-panel">
+      <div class="fila" style="align-items:center">
+        <b>💡 Reglas del equipo</b><span class="mini muted" id="reglasEstado">${esc(S.reglasEstado || "")}</span>
+        <button class="btn chico" data-acc="reglas">Aplicar reglas del equipo (IA)</button>
+      </div>
+      <div class="fila" style="margin-top:8px">
+        <div class="campo" style="flex:3"><input type="text" id="rSug" maxlength="500" placeholder="¿Algo que la herramienta debería considerar la próxima vez? Ej. las propinas siempre se registran aparte"></div>
+        <div class="campo" style="max-width:180px"><select id="rSugAlc"><option value="ambas">Lectura y revisión</option><option value="revision">Solo revisión</option><option value="lectura">Solo lectura</option></select></div>
+        <button class="btn" data-acc="sugerir">Guardar sugerencia</button>
+      </div></div>` : ""}
   </div>`;
-  if (editable) $("#rEstado", cont).value = c.error || exc ? "rechazado" : c.warn ? "con_observaciones" : "aprobado";
+  if (editable) {
+    $("#rEstado", cont).value = ui.dictamen || (c.error || exc ? "rechazado" : c.warn ? "con_observaciones" : "aprobado");
+    $("#rEstado", cont).addEventListener("change", e => { ui.dictamen = e.target.value; });
+    $("#rComent", cont).addEventListener("input", e => { ui.comentario = e.target.value; });
+  }
+  const aplicarFiltro = () => $$("tbody tr[data-st]", cont).forEach(tr => tr.classList.toggle("oculto", ui.filtro !== "todos" && tr.dataset.st !== ui.filtro));
+  aplicarFiltro();
   $$(`#${fid} button`, cont).forEach(b => b.addEventListener("click", () => {
     $$(`#${fid} button`, cont).forEach(x => x.classList.toggle("activo", x === b));
-    $$("tbody tr[data-st]", cont).forEach(tr => tr.classList.toggle("oculto", b.dataset.f !== "todos" && tr.dataset.st !== b.dataset.f));
+    ui.filtro = b.dataset.f; aplicarFiltro();
   }));
+  // Revisión manual: aprobar, eliminar y restaurar líneas
+  const sc = $("[data-scroll]", cont); if (sc && ui.scroll) sc.scrollTop = ui.scroll;
+  const redibujar = () => { ui.scroll = $("[data-scroll]", cont)?.scrollTop || 0; ui.verEliminadas = $("[data-det-elim]", cont)?.open; renderResultados(cont, R, opts); };
+  const sello = extra => ({ por: S.usuario || "—", fecha: new Date().toISOString(), ...extra });
+  $$("[data-aprobar]", cont).forEach(chk => chk.addEventListener("change", () => {
+    R.manual ||= {};
+    if (chk.checked) {
+      const nota = prompt("Aprobación manual: ¿quieres dejar un comentario? (opcional)", "");
+      if (nota === null) { chk.checked = false; return; }
+      R.manual[chk.dataset.aprobar] = sello({ nota: nota.trim() });
+    } else delete R.manual[chk.dataset.aprobar];
+    redibujar();
+  }));
+  $$("[data-eliminar]", cont).forEach(b => b.addEventListener("click", () => {
+    const motivo = prompt("¿Por qué se elimina esta línea de la revisión? (opcional)\nPodrás restaurarla desde 'Líneas eliminadas'.", "");
+    if (motivo === null) return;
+    (R.eliminadas ||= {})[b.dataset.eliminar] = sello({ motivo: motivo.trim() });
+    redibujar();
+  }));
+  $$("[data-restaurar]", cont).forEach(b => b.addEventListener("click", () => { delete R.eliminadas[b.dataset.restaurar]; ui.verEliminadas = true; redibujar(); }));
   $("[data-acc=excel]", cont).addEventListener("click", () => exportarExcel(R));
   const bg = $("[data-acc=guardar]", cont); if (bg) bg.addEventListener("click", () => guardar(R, bg));
+  const br = $("[data-acc=reglas]", cont); if (br) br.addEventListener("click", () => aplicarReglas(true));
+  const bs = $("[data-acc=sugerir]", cont); if (bs) bs.addEventListener("click", async () => {
+    const txt = $("#rSug", cont).value.trim();
+    if (await guardarSugerencia(txt, $("#rSugAlc", cont).value)) $("#rSug", cont).value = "";
+  });
+  const bn = $("[data-acc=nueva]", cont); if (bn) bn.addEventListener("click", () => {
+    if (!S.guardado && !confirm("Esta revisión no se ha guardado en el historial. ¿Empezar una nueva de todas formas? Se borrarán el Excel, los comprobantes y los resultados.")) return;
+    nuevaRevision();
+  });
   const bb = $("[data-acc=borrar]", cont); if (bb) bb.addEventListener("click", () => borrarRegistro(registro.id));
 }
-function filaResultado(v, ml) {
+function filaResultado(v, ml, editable = false) {
   const x = v.x, f = x.factura, l = x.linea, st = v.estado === "na" ? "ok" : v.estado;
-  const chips = v.campos.filter(c => c.st !== "na" || c.nota).map(c => `<span class="chip ${c.st}">${ICONO[c.st]} ${esc(c.c)}${c.nota ? ": " + esc(c.nota) : ""}</span>`).join("");
-  const notas = v.notas.length ? `<ul class="notas">${v.notas.map(n => `<li>${esc(n)}</li>`).join("")}</ul>` : "";
+  // Detalle ordenado: primero lo que está bien (en una fila) y luego cada hallazgo en su propia línea (ℹ️, ⚠️, ❌)
+  const chip = c => `<span class="chip ${c.regla && c.st === "na" ? "regla" : c.st}">${ICONO[c.st]} ${esc(c.c)}${c.nota ? ": " + esc(c.nota) : ""}</span>`;
+  const visibles = v.campos.filter(c => c.st !== "na" || c.nota);
+  const okChips = visibles.filter(c => c.st === "ok").map(chip).join("");
+  const orden = { na: 0, warn: 1, error: 2 };
+  const hallazgos = visibles.filter(c => c.st !== "ok").sort((a, b) => orden[a.st] - orden[b.st]).map(c => `<div>${chip(c)}</div>`).join("");
+  const manualChip = v.manual ? `<div class="det-lineas"><span class="chip ok">✅ Aprobado manualmente por ${esc(v.manual.por)} · ${new Date(v.manual.fecha).toLocaleString("es-CR", { dateStyle: "short", timeStyle: "short" })}${v.manual.nota ? " · " + esc(v.manual.nota) : ""}</span></div>` : "";
+  const chips = `${manualChip}${okChips ? `<div class="det">${okChips}</div>` : ""}${hallazgos ? `<div class="det-lineas ${v.manual ? "anulado" : ""}">${hallazgos}</div>` : ""}`;
+  const notas = v.notas.length ? `<ul class="notas ${v.manual ? "anulado" : ""}">${v.notas.map(n => `<li>${esc(n)}</li>`).join("")}</ul>` : "";
+  const acciones = !editable ? "" : `<td><div class="acciones">
+      <label title="Marca la línea como revisada y correcta"><input type="checkbox" data-aprobar="${esc(v.clave)}" ${v.manual ? "checked" : ""} ${v.estadoOriginal === "ok" && !v.manual ? "disabled" : ""}> Aprobado manual</label>
+      <button class="btn-basura" data-eliminar="${esc(v.clave)}" title="Quitar esta línea de la revisión">🗑 Eliminar</button></div></td>`;
   if (v.tipo === "propina") {
     const t = v.tip;
     return `<tr data-st="${st}" style="background:#FCFCFD">
       <td style="white-space:nowrap"><b style="font-size:15px">${esc(t.id_gasto)}</b><div class="mini muted">propina de ${esc(l.solo_propina ? "—" : l.id_gasto)}</div></td>
-      <td title="${TXT_ESTADO[st]}" style="font-size:16px">${ICONO[st]}</td>
-      <td><b>${esc(t.numero)}</b><div class="mini">${esc(l.proveedor)}</div><div class="mini muted">Gasto ${esc(t.fecha_gasto || l.fecha_gasto || "—")} · línea de propina</div></td>
+      <td title="${v.manual ? "Aprobado manualmente" : TXT_ESTADO[st]}" style="font-size:16px">${ICONO[st]}${v.manual ? '<div class="mini muted" style="font-size:10px">manual</div>' : ""}</td>
+      <td><b>${esc(t.numero)}</b><div class="mini">${esc(l.proveedor)}</div><div class="mini muted">Gasto ${esc(fFecha(t.fecha_gasto || l.fecha_gasto) || "—")} · línea de propina</div></td>
       <td class="mini">${f ? `Propina de la factura <b>${esc(f.numero || f.clave || "")}</b>` : '<span class="muted">— sin comprobante —</span>'}</td>
       <td class="num">${money(t.monto)}${t.monto_local !== t.monto ? `<div class="mini muted">${esc(mm(ml, t.monto_local))}</div>` : ""}</td>
       <td class="num">${f ? esc(mm(f.moneda, f.propina || 0)) : ""}</td>
-      <td><div class="det">${chips}</div>${notas}</td></tr>`;
+      <td>${chips}${notas}</td>${acciones}</tr>`;
   }
   const conPropinaAparte = (l?.propinas || []).length > 0;
   return `<tr data-st="${st}">
     <td style="white-space:nowrap"><b style="font-size:15px">${esc(l ? l.id_gasto : "—")}</b></td>
-    <td title="${TXT_ESTADO[st]}" style="font-size:16px">${ICONO[st]}</td>
-    <td style="min-width:170px">${l ? `<b>${esc(l.numero)}</b><div class="mini">${esc(l.proveedor)}</div><div class="mini muted">Gasto ${esc(l.fecha_gasto || "—")}${l.finalidad ? " · " + esc(l.finalidad) : ""}</div>` : '<span class="muted">— sin línea en SAP —</span>'}</td>
-    <td style="min-width:170px">${f ? `<b>${esc(f.numero || f.clave || "Sin número")}</b><div class="mini">${esc(f.proveedor)}</div><div class="mini muted">${esc([f.fecha, f.hora, f.pais, f.categoria].filter(Boolean).join(" · "))}</div><div class="mini muted">${esc(f.archivo)}</div>` : '<span class="muted">— sin comprobante —</span>'}</td>
-    <td class="num">${l ? `${money(l.monto)}${l.monto_local !== l.monto ? `<div class="mini muted">${esc(mm(ml, l.monto_local))}</div>` : ""}${!conPropinaAparte && l.propina ? `<div class="mini muted">+ propina ${money(l.propina)}</div>` : ""}` : ""}</td>
+    <td title="${v.manual ? "Aprobado manualmente" : TXT_ESTADO[st]}" style="font-size:16px">${ICONO[st]}${v.manual ? '<div class="mini muted" style="font-size:10px">manual</div>' : ""}</td>
+    <td style="min-width:170px">${l ? `<b>${esc(l.numero)}</b><div class="mini">${esc(l.proveedor)}</div><div class="mini muted">Gasto ${esc(fFecha(l.fecha_gasto) || "—")}${l.fecha_inicio ? ` · estadía ${esc(fFecha(l.fecha_inicio))}–${esc(fFecha(l.fecha_fin))}` : ""}${l.finalidad ? " · " + esc(l.finalidad) : ""}</div>${l.tipo_gasto ? `<div class="mini muted">${esc(l.tipo_gasto)}</div>` : ""}` : '<span class="muted">— sin línea en SAP —</span>'}</td>
+    <td style="min-width:170px">${f ? `<b>${esc(f.numero || f.clave || "Sin número")}</b><div class="mini">${esc(f.proveedor)}${f.nombre_comercial ? ` <span class="muted">(${esc(f.nombre_comercial)})</span>` : ""}</div><div class="mini muted">${esc([fFecha(f.fecha), f.hora, f.pais, f.categoria].filter(Boolean).join(" · "))}</div><div class="mini muted">${esc(f.archivo)}</div>` : '<span class="muted">— sin comprobante —</span>'}</td>
+    <td class="num">${l ? `${l.moneda ? esc(l.moneda) + " " : ""}${money(l.monto)}${l.monto_local !== l.monto ? `<div class="mini muted">${esc(mm(ml, l.monto_local))}</div>` : ""}${!conPropinaAparte && l.propina ? `<div class="mini muted">+ propina ${money(l.propina)}</div>` : ""}` : ""}</td>
     <td class="num">${f ? `${esc(mm(f.moneda, f.total))}${!conPropinaAparte && f.propina ? `<div class="mini muted">+ propina ${money(f.propina)}</div>` : ""}` : ""}</td>
-    <td><div class="det">${chips}</div>${notas}</td></tr>`;
+    <td>${chips}${notas}</td>${acciones}</tr>`;
 }
 
 function exportarExcel(R) {
@@ -1616,9 +2363,14 @@ function exportarExcel(R) {
   const filas = filasVista(R).map(v => {
     const x = v.x, f = x.factura, l = x.linea, t = v.tip, esProp = v.tipo === "propina";
     return {
-      "ID de gasto": v.id ?? "", "Tipo": esProp ? "Propina" : "Factura", "Estado": TXT_ESTADO[v.estado === "na" ? "ok" : v.estado],
+      "ID de gasto": v.id ?? "", "Tipo": esProp ? "Propina" : "Factura",
+      "Estado": v.manual ? "Aprobado manualmente" : TXT_ESTADO[v.estado === "na" ? "ok" : v.estado],
+      "Estado original": TXT_ESTADO[v.estadoOriginal === "na" ? "ok" : v.estadoOriginal],
+      "Aprobado por": v.manual ? `${v.manual.por} · ${new Date(v.manual.fecha).toLocaleString("es-CR")}${v.manual.nota ? " · " + v.manual.nota : ""}` : "",
       "ID factura SAP": esProp ? t.numero : (l?.numero ?? ""), "Proveedor SAP": l?.proveedor ?? "",
       "Fecha de gasto": esProp ? (t.fecha_gasto || l?.fecha_gasto || "") : (l?.fecha_gasto ?? ""),
+      "Tipo de gasto": esProp ? (t.tipo_gasto || l?.tipo_gasto || "") : (l?.tipo_gasto ?? ""),
+      "Fecha de inicio": l?.fecha_inicio ?? "", "Fecha de fin": l?.fecha_fin ?? "", "Moneda SAP": esProp ? (t.moneda || l?.moneda || "") : (l?.moneda ?? ""),
       "Importe SAP": esProp ? t.monto : (l?.monto ?? ""), [`Importe SAP ${ml}`]: esProp ? t.monto_local : (l?.monto_local ?? ""),
       "Impuesto SAP": esProp ? t.impuesto : (l?.impuesto ?? ""),
       "No. comprobante": f?.numero || f?.clave || "", "Fecha comprobante": f?.fecha ?? "", "Proveedor comprobante": f?.proveedor ?? "",
@@ -1633,7 +2385,11 @@ function exportarExcel(R) {
     "Moneda": x.moneda, "Monto neto": x.monto, "Límite": x.limite, "Exceso": x.exceso > 0.01 ? x.exceso : 0, "Notas": x.notas.join(" | ") }));
   const wb = XLSX.utils.book_new();
   const hoja = (rows, nombre) => { const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ "Sin datos": "" }]); ws["!cols"] = Object.keys(rows[0] || { a: 1 }).map(k => ({ wch: Math.min(45, Math.max(10, k.length + 2)) })); XLSX.utils.book_append_sheet(wb, ws, nombre); };
-  hoja(filas, "Revisión"); hoja(lim, "Límites");
+  const elim = filasVista(R, { incluirEliminadas: true }).filter(v => v.eliminada).map(v => ({
+    "ID de gasto": v.id ?? "", "Tipo": v.tipo === "propina" ? "Propina" : "Factura",
+    "ID factura SAP": v.tipo === "propina" ? v.tip.numero : (v.x.linea?.numero ?? ""), "Proveedor": v.x.linea?.proveedor || v.x.factura?.proveedor || "",
+    "Comprobante": v.x.factura?.numero || "", "Eliminada por": v.eliminada.por, "Fecha": new Date(v.eliminada.fecha).toLocaleString("es-CR"), "Motivo": v.eliminada.motivo || "" }));
+  hoja(filas, "Revisión"); hoja(lim, "Límites"); if (elim.length) hoja(elim, "Eliminadas");
   XLSX.writeFile(wb, `Revision_informe_${String(R.cab?.informe || "gastos").replace(/[^\w-]+/g, "_")}_${new Date().toISOString().slice(0, 10)}.xlsx`);
 }
 
@@ -1648,7 +2404,8 @@ async function guardar(R, boton) {
   const detalle = {
     version: 2, cab: R.cab, monedaLocal: R.monedaLocal, paisEmpresa: R.paisEmpresa, regimen: R.regimen,
     totalFacturas: R.totalFacturas, totalLineas: R.totalLineas, totFactLocal: R.totFactLocal, totSap: R.totSap,
-    politica: S.politica, politicaMeta: S.politicaMeta, resultados: R.resultados, limites: R.limites
+    politica: S.politica, politicaMeta: S.politicaMeta, resultados: R.resultados, limites: R.limites,
+    manual: R.manual || {}, eliminadas: R.eliminadas || {}, movimientos: R.movimientos || []
   };
   const { error } = await sb.from(C.TABLA).insert({
     user_id: user.id, user_email: user.email, informe_id: R.cab?.informe || null, empleado: R.cab?.empleado || null,
@@ -1661,10 +2418,338 @@ async function guardar(R, boton) {
   boton.disabled = false; boton.textContent = "Guardar en historial";
   if (error) return toast("No se pudo guardar: " + error.message, 6000);
   toast("Revisión guardada en el historial.");
+  S.guardado = true;
   if (confirm("Guardado. ¿Limpiar las facturas para revisar otro informe? (el Excel se mantiene cargado)")) reiniciar();
 }
+
+/* =====================================================================
+   PLATAFORMA: módulos, menú lateral, navegación y accesos
+   Para agregar un agente: 1) su pantalla en un <div id="m…" class="modulo">, 2) una entrada en MODULOS_APP,
+   3) el módulo en Administración → Módulos (o en la tabla public.modulos) y asignarlo a los usuarios.
+   ===================================================================== */
+const MOD_REVISOR = "revisor_gastos";
+const ICONOS = {
+  inicio: "M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10",
+  recibo: "M6 3h12v18l-3-2-3 2-3-2-3 2zM9 8h6M9 12h6M9 16h4",
+  admin: "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6zM9 12l2 2 4-4",
+  modulo: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
+  banco: "M3 10l9-6 9 6M5 10v8M9 10v8M15 10v8M19 10v8M3 20h18",
+  documento: "M7 3h7l5 5v13H7zM14 3v5h5M10 13h6M10 17h6",
+  grafico: "M4 20V10M10 20V4M16 20v-7M22 20H2",
+};
+const svgIco = k => `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONOS[k] || ICONOS.modulo}"/></svg>`;
+/** Pantallas publicadas en este archivo. Un módulo de la base de datos sin entrada aquí se muestra "en construcción". */
+const MODULOS_APP = {
+  [MOD_REVISOR]: { el: "#mRevisor", alAbrir: () => { cargarCapacidad(); } },
+};
+const PL = { modulos: [], permitidos: new Set(), instalada: true, asignaciones: [] };
+const puedeUsar = clave => PL.permitidos.has(clave);
+
+async function cargarPlataforma() {
+  const { data: mods, error } = await sb.from("modulos").select("*").order("orden").order("nombre");
+  if (error) {
+    // La plataforma aún no está instalada (falta correr el schema.sql nuevo): todos usan el revisor, como antes
+    PL.instalada = false;
+    PL.modulos = [{ clave: MOD_REVISOR, nombre: "Revisión de gastos SAP", descripcion: "Compara los comprobantes contra el informe de gastos de SAP ByD y valida la política de viáticos, giras y viajes.", icono: "recibo", orden: 10, activo: true }];
+    PL.permitidos = new Set([MOD_REVISOR]);
+  } else {
+    PL.instalada = true;
+    PL.modulos = mods || [];
+    if (S.esAdmin) PL.permitidos = new Set(PL.modulos.filter(m => m.activo).map(m => m.clave));
+    else {
+      const { data: um } = await sb.from("usuario_modulos").select("modulo").eq("user_id", sesionUid);
+      const activos = new Set(PL.modulos.filter(m => m.activo).map(m => m.clave));
+      PL.permitidos = new Set((um || []).map(r => r.modulo).filter(c => activos.has(c)));
+    }
+  }
+  dibujarMenu(); dibujarInicio();
+}
+function dibujarMenu() {
+  const mods = PL.modulos.filter(m => PL.permitidos.has(m.clave));
+  const item = (ruta, ico, nombre) => `<a href="#/${ruta}" data-ruta="${ruta}" title="${esc(nombre)}">${svgIco(ico)}<span class="lbl">${esc(nombre)}</span></a>`;
+  $("#sideNav").innerHTML = item("inicio", "inicio", "Inicio")
+    + (mods.length ? `<div class="grupo">Módulos</div>` + mods.map(m => item(m.clave, m.icono, m.nombre)).join("") : "")
+    + (S.esAdmin && PL.instalada ? `<div class="grupo">Plataforma</div>` + item("admin", "admin", "Administración") : "");
+}
+function dibujarInicio() {
+  const mods = PL.modulos.filter(m => PL.permitidos.has(m.clave));
+  $("#tilesInicio").innerHTML = mods.length ? mods.map(m => {
+    const listo = !!MODULOS_APP[m.clave];
+    return `<a class="tile${listo ? "" : " prox"}" href="#/${m.clave}"><div class="t-ico">${svgIco(m.icono)}</div><b>${esc(m.nombre)}</b><p>${esc(m.descripcion || "")}</p><span class="ir">${listo ? "Abrir →" : "En construcción"}</span></a>`;
+  }).join("") + (S.esAdmin && PL.instalada ? `<a class="tile" href="#/admin"><div class="t-ico">${svgIco("admin")}</div><b>Administración</b><p>Usuarios, módulos asignados e historial de accesos.</p><span class="ir">Abrir →</span></a>` : "")
+    : `<div class="tarjeta vacio" style="grid-column:1/-1"><div class="vacio-ico">${svgIco("modulo")}</div><h2 style="justify-content:center">Aún no tienes módulos asignados</h2><p class="sub">Pide a un administrador de la plataforma que te asigne los módulos que necesitas.</p></div>`;
+  $("#avisoPlataforma").innerHTML = !PL.instalada && S.esAdmin
+    ? `<div class="aviso warn" style="margin-bottom:14px">La administración de módulos aún no está instalada: ejecuta el <b>schema.sql</b> nuevo en el SQL Editor de Supabase. Mientras tanto, todos los usuarios ven el módulo de revisión de gastos, como antes.</div>` : "";
+}
+function navegar() {
+  if ($("#vApp").classList.contains("oculto")) return;
+  let ruta = (location.hash.match(/^#\/([a-z0-9_]+)/) || [])[1] || "inicio";
+  if (ruta !== "inicio" && ruta !== "admin" && !puedeUsar(ruta)) {
+    if (PL.modulos.length) toast("No tienes acceso a ese módulo.");
+    ruta = "inicio"; history.replaceState(null, "", "#/inicio");
+  }
+  if (ruta === "admin" && !(S.esAdmin && PL.instalada)) { ruta = "inicio"; history.replaceState(null, "", "#/inicio"); }
+  const mod = PL.modulos.find(m => m.clave === ruta);
+  const el = ruta === "inicio" ? "#mInicio" : ruta === "admin" ? "#mAdmin" : (MODULOS_APP[ruta]?.el || "#mProx");
+  $$(".modulo").forEach(m => m.classList.toggle("oculto", "#" + m.id !== el));
+  if (el === "#mProx") { $("#proxNombre").textContent = mod?.nombre || ruta; $("#proxDesc").textContent = mod?.descripcion || ""; }
+  $$("#sideNav a").forEach(a => a.classList.toggle("activo", a.dataset.ruta === ruta));
+  const titulo = ruta === "inicio" ? "" : ruta === "admin" ? "Administración" : (mod?.nombre || "");
+  $("#miga").textContent = titulo;
+  document.title = (titulo ? titulo + " · " : "") + C.NOMBRE_PLATAFORMA;
+  if (ruta === "admin") abrirAdmin(PL.adminTab || "usuarios");
+  MODULOS_APP[ruta]?.alAbrir?.();
+  document.body.classList.remove("side-abierta");
+  window.scrollTo(0, 0);
+}
+window.addEventListener("hashchange", navegar);
+$("#bMenu").addEventListener("click", () => {
+  if (matchMedia("(max-width:900px)").matches) document.body.classList.toggle("side-abierta");
+  else { document.body.classList.toggle("side-min"); try { localStorage.setItem("plat-side-min", document.body.classList.contains("side-min") ? "1" : ""); } catch {} }
+});
+$("#velo").addEventListener("click", () => document.body.classList.remove("side-abierta"));
+try { if (localStorage.getItem("plat-side-min")) document.body.classList.add("side-min"); } catch {}
+$("#platNombre").textContent = C.NOMBRE_PLATAFORMA; $("#loginNombre").textContent = C.NOMBRE_PLATAFORMA; document.title = C.NOMBRE_PLATAFORMA;
+
+/* ---------- Administración ---------- */
+function abrirAdmin(tab) {
+  PL.adminTab = tab;
+  $$("#mAdmin header nav button").forEach(b => b.classList.toggle("activo", b.dataset.adm === tab));
+  $("#tUsuarios").classList.toggle("oculto", tab !== "usuarios");
+  $("#aModulos").classList.toggle("oculto", tab !== "modulos");
+  $("#aBitacora").classList.toggle("oculto", tab !== "bitacora");
+  if (tab === "usuarios") { dibujarFormUsuario(); cargarUsuarios(); }
+  if (tab === "modulos") cargarModulosAdmin();
+  if (tab === "bitacora") cargarBitacora();
+}
+$$("#mAdmin header nav button").forEach(b => b.addEventListener("click", () => abrirAdmin(b.dataset.adm)));
+async function cargarAsignaciones() {
+  const { data, error } = await sb.from("usuario_modulos").select("user_id,modulo,asignado_por,asignado_en");
+  PL.asignaciones = error ? [] : (data || []);
+  return !error;
+}
+async function cambiarAcceso(userId, modulo, dar) {
+  const { error } = dar
+    ? await sb.from("usuario_modulos").insert({ user_id: userId, modulo })
+    : await sb.from("usuario_modulos").delete().eq("user_id", userId).eq("modulo", modulo);
+  if (error) { toast("No se pudo cambiar el acceso: " + error.message, 6000); return false; }
+  toast(dar ? "Módulo asignado." : "Módulo retirado.");
+  return true;
+}
+/* ---------- Crear usuario ---------- */
+function generarClave() {
+  const abc = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789", sim = "!@#$%*?";
+  const r = new Uint32Array(14); crypto.getRandomValues(r);
+  let c = Array.from(r.slice(0, 12), n => abc[n % abc.length]).join("");
+  return c.slice(0, 4) + sim[r[12] % sim.length] + c.slice(4) + (r[13] % 90 + 10);
+}
+function dibujarFormUsuario() {
+  const cont = $("#nuModulos"); if (!cont) return;
+  const marcados = new Set($$("[data-nu-mod]:checked", cont).map(c => c.dataset.nuMod));
+  cont.innerHTML = PL.modulos.filter(m => m.activo).map(m => `<label class="mod-chk"><input type="checkbox" data-nu-mod="${esc(m.clave)}" ${marcados.has(m.clave) ? "checked" : ""}>${esc(m.nombre)}</label>`).join("")
+    || '<span class="mini muted">No hay módulos activos.</span>';
+  if (!$("#nuClave").value) $("#nuClave").value = generarClave();
+}
+$("#bGenClave").addEventListener("click", () => { $("#nuClave").value = generarClave(); });
+$("#nuAdmin").addEventListener("change", e => $$("[data-nu-mod]").forEach(c => { c.disabled = e.target.checked; }));
+$("#fNuevoUsuario").addEventListener("submit", async e => {
+  e.preventDefault();
+  const datos = { nombre: $("#nuNombre").value.trim(), email: $("#nuEmail").value.trim().toLowerCase(), password: $("#nuClave").value,
+    admin: $("#nuAdmin").checked, modulos: $$("[data-nu-mod]:checked").map(c => c.dataset.nuMod) };
+  if (datos.password.length < 8) return toast("La contraseña temporal debe tener al menos 8 caracteres.");
+  if (!datos.admin && !datos.modulos.length && !confirm("No marcaste ningún módulo: el usuario podrá entrar pero no verá nada hasta que se lo asignes. ¿Crear de todas formas?")) return;
+  const b = $("#bCrearUsuario"); b.disabled = true; b.textContent = "Creando…";
+  try {
+    await llamarAdmin("crear", datos);
+    const nombresMods = datos.admin ? "todos (administrador)" : datos.modulos.map(c => PL.modulos.find(m => m.clave === c)?.nombre || c).join(", ") || "ninguno";
+    const texto = `Usuario: ${datos.email}\nContraseña temporal: ${datos.password}\nIngreso: ${location.origin}${location.pathname}`;
+    $("#nuResultado").innerHTML = `<div class="cred"><b>✅ ${esc(datos.nombre || datos.email)} creado.</b>
+      <span>Correo: <code>${esc(datos.email)}</code></span><span>Contraseña temporal: <code>${esc(datos.password)}</code></span>
+      <span class="mini">Módulos: ${esc(nombresMods)}</span><button type="button" class="btn chico" id="bCopiarCred">Copiar datos de acceso</button></div>`;
+    $("#bCopiarCred").addEventListener("click", async () => { try { await navigator.clipboard.writeText(texto); toast("Datos copiados: envíaselos al usuario por un canal seguro."); } catch { toast("No se pudo copiar; selecciónalos manualmente."); } });
+    $("#fNuevoUsuario").reset(); $("#nuClave").value = generarClave(); dibujarFormUsuario();
+    cargarUsuarios();
+  } catch (err) {
+    toast("No se pudo crear: " + err.message, 7000);
+  } finally { b.disabled = false; b.textContent = "Crear usuario"; }
+});
+
+async function cargarModulosAdmin() {
+  const t = $("#tModulos");
+  const { data: mods, error } = await sb.from("modulos").select("*").order("orden").order("nombre");
+  if (error) { t.innerHTML = `<tbody><tr><td><div class="aviso error">${esc(error.message)}</div></td></tr></tbody>`; return; }
+  await cargarAsignaciones();
+  const cuenta = c => PL.asignaciones.filter(a => a.modulo === c).length;
+  const opIco = Object.keys(ICONOS).filter(k => !["inicio", "admin"].includes(k));
+  t.innerHTML = `<thead><tr><th></th><th>Clave</th><th>Nombre</th><th>Descripción</th><th>Icono</th><th class="num">Orden</th><th class="num">Usuarios</th><th>Estado</th></tr></thead><tbody>` +
+    mods.map(m => `<tr data-mod="${esc(m.clave)}">
+      <td style="color:var(--primario)">${svgIco(m.icono)}</td>
+      <td class="mini"><code>${esc(m.clave)}</code>${MODULOS_APP[m.clave] ? "" : '<div class="chip na" style="margin-top:4px">en construcción</div>'}</td>
+      <td><input type="text" data-c="nombre" value="${esc(m.nombre)}" maxlength="80"></td>
+      <td><input type="text" data-c="descripcion" value="${esc(m.descripcion || "")}" maxlength="240"></td>
+      <td><select data-c="icono">${opIco.map(k => `<option ${m.icono === k ? "selected" : ""}>${k}</option>`).join("")}</select></td>
+      <td class="num"><input type="number" data-c="orden" value="${m.orden}" style="width:70px"></td>
+      <td class="num">${cuenta(m.clave)}</td>
+      <td><label class="check"><input type="checkbox" data-c="activo" ${m.activo ? "checked" : ""}> Activo</label></td></tr>`).join("") + "</tbody>";
+  $$("[data-c]", t).forEach(inp => inp.addEventListener("change", async () => {
+    const clave = inp.closest("tr").dataset.mod, campo = inp.dataset.c;
+    const valor = campo === "activo" ? inp.checked : campo === "orden" ? parseInt(inp.value, 10) || 100 : inp.value.trim();
+    if (campo === "activo" && !valor && !confirm("Al desactivar el módulo, nadie (salvo administradores) podrá usarlo ni ver sus datos. ¿Continuar?")) { inp.checked = true; return; }
+    const { error: e } = await sb.from("modulos").update({ [campo]: valor }).eq("clave", clave);
+    toast(e ? "No se pudo guardar: " + e.message : "Módulo actualizado.");
+    if (!e) cargarPlataforma();
+  }));
+}
+$("#bNuevoModulo").addEventListener("click", async () => {
+  const clave = $("#nmClave").value.trim().toLowerCase(), nombre = $("#nmNombre").value.trim();
+  if (!/^[a-z0-9_]{3,40}$/.test(clave)) return toast("La clave debe tener de 3 a 40 letras minúsculas, números o guion bajo.");
+  if (!nombre) return toast("Escribe el nombre del módulo.");
+  const { error } = await sb.from("modulos").insert({ clave, nombre, descripcion: $("#nmDesc").value.trim() || null, icono: "modulo", orden: 100 });
+  if (error) return toast("No se pudo agregar: " + error.message, 6000);
+  ["#nmClave", "#nmNombre", "#nmDesc"].forEach(s => $(s).value = "");
+  toast("Módulo agregado. Asígnalo a los usuarios en Usuarios y accesos.");
+  await cargarPlataforma(); cargarModulosAdmin();
+});
+async function cargarBitacora() {
+  const t = $("#tBitacora");
+  t.innerHTML = `<tbody><tr><td class="muted">Cargando…</td></tr></tbody>`;
+  const { data, error } = await sb.from("usuario_modulos_historial").select("*").order("fecha", { ascending: false }).limit(300);
+  if (error) { t.innerHTML = `<tbody><tr><td><div class="aviso error">${esc(error.message)}</div></td></tr></tbody>`; return; }
+  if (!data.length) { t.innerHTML = `<tbody><tr><td class="muted">Sin movimientos todavía.</td></tr></tbody>`; return; }
+  const nom = c => PL.modulos.find(m => m.clave === c)?.nombre || c;
+  t.innerHTML = `<thead><tr><th>Fecha</th><th>Usuario</th><th>Módulo</th><th>Acción</th><th>Hecho por</th></tr></thead><tbody>` +
+    data.map(r => `<tr><td class="mini">${new Date(r.fecha).toLocaleString("es-CR", { dateStyle: "short", timeStyle: "short" })}</td><td>${esc(r.email || r.user_id || "")}</td><td>${r.modulo ? esc(nom(r.modulo)) : '<span class="muted">—</span>'}</td>
+      <td>${{ "asignado": '<span class="chip ok">Módulo asignado</span>', "retirado": '<span class="chip error">Módulo retirado</span>', "usuario creado": '<span class="chip proc">Usuario creado</span>', "usuario eliminado": '<span class="chip error">Usuario eliminado</span>' }[r.accion] || esc(r.accion)}</td><td class="mini">${esc(r.hecho_por || "")}</td></tr>`).join("") + "</tbody>";
+}
+
+/* =====================================================================
+   SUGERENCIAS DEL EQUIPO
+   ===================================================================== */
+const ALCANCES = { ambas: "Lectura y revisión", revision: "Solo revisión", lectura: "Solo lectura" };
+async function contarReglas() {
+  const { data, error } = await sb.from(C.TABLA_SUGERENCIAS).select("alcance").eq("activa", true);
+  S.reglasRevision = error ? 0 : (data || []).filter(r => r.alcance !== "lectura").length;
+  S.reglasLectura = error ? 0 : (data || []).filter(r => r.alcance !== "revision").length;
+  S.sugerenciasDisponibles = !error;
+}
+async function guardarSugerencia(texto, alcance) {
+  if (!texto || texto.length < 5) { toast("Escribe la sugerencia (mínimo 5 caracteres)."); return false; }
+  const { error } = await sb.from(C.TABLA_SUGERENCIAS).insert({ texto: texto.slice(0, 500), alcance });
+  if (error) { toast(/relation|does not exist|schema cache/i.test(error.message) ? "Falta crear la tabla de sugerencias: ejecuta el schema.sql nuevo en Supabase." : "No se pudo guardar: " + error.message, 6000); return false; }
+  toast("Sugerencia guardada: se aplicará en las próximas revisiones.");
+  await contarReglas();
+  if (!$("#tSugerencias").classList.contains("oculto")) cargarSugerencias();
+  return true;
+}
+async function cargarSugerencias() {
+  $("#tSug").innerHTML = `<tbody><tr><td class="muted">Cargando…</td></tr></tbody>`;
+  const { data, error } = await sb.from(C.TABLA_SUGERENCIAS).select("*").order("activa", { ascending: false }).order("created_at", { ascending: false });
+  if (error) {
+    $("#tSug").innerHTML = "";
+    $("#sugAviso").innerHTML = `<div class="aviso error">${/relation|does not exist|schema cache/i.test(error.message) ? "Falta crear la tabla de sugerencias: ejecuta el schema.sql nuevo en el SQL Editor de Supabase." : esc(error.message)}</div>`;
+    return;
+  }
+  $("#sugAviso").innerHTML = "";
+  if (!data.length) { $("#tSug").innerHTML = `<tbody><tr><td class="muted">Aún no hay sugerencias. La primera que guardes se aplicará desde la siguiente revisión.</td></tr></tbody>`; return; }
+  const f = d => d ? new Date(d).toLocaleString("es-CR", { dateStyle: "short", timeStyle: "short" }) : "";
+  $("#tSug").innerHTML = `<thead><tr><th>Activa</th><th>Sugerencia</th><th>Se aplica en</th><th>Creada por</th><th>Último cambio</th>${S.esAdmin ? "<th></th>" : ""}</tr></thead><tbody>` +
+    data.map(r => `<tr style="${r.activa ? "" : "opacity:.55"}">
+      <td><input type="checkbox" data-sug-act="${r.id}" ${r.activa ? "checked" : ""} title="Activar o desactivar"></td>
+      <td class="txt">${esc(r.texto)}</td>
+      <td><select data-sug-alc="${r.id}">${Object.entries(ALCANCES).map(([k, v]) => `<option value="${k}" ${r.alcance === k ? "selected" : ""}>${v}</option>`).join("")}</select></td>
+      <td class="mini">${esc(r.creado_por || "")}<div class="muted">${f(r.created_at)}</div></td>
+      <td class="mini">${r.actualizado_por ? `${esc(r.actualizado_por)}<div class="muted">${f(r.updated_at)}</div>` : ""}</td>
+      ${S.esAdmin ? `<td><button class="btn chico" data-sug-del="${r.id}" title="Eliminar (solo administradores)">🗑</button></td>` : ""}</tr>`).join("") + "</tbody>";
+  const actualizar = async (id, cambios) => {
+    const { error: e } = await sb.from(C.TABLA_SUGERENCIAS).update(cambios).eq("id", id);
+    toast(e ? "No se pudo actualizar: " + e.message : "Sugerencia actualizada."); await contarReglas(); cargarSugerencias();
+  };
+  $$("[data-sug-act]").forEach(c => c.addEventListener("change", () => actualizar(c.dataset.sugAct, { activa: c.checked })));
+  $$("[data-sug-alc]").forEach(s => s.addEventListener("change", () => actualizar(s.dataset.sugAlc, { alcance: s.value })));
+  $$("[data-sug-del]").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("¿Eliminar esta sugerencia definitivamente? (Para dejar de aplicarla basta con desactivarla)")) return;
+    const { error: e } = await sb.from(C.TABLA_SUGERENCIAS).delete().eq("id", b.dataset.sugDel);
+    toast(e ? "No se pudo eliminar: " + e.message : "Sugerencia eliminada."); await contarReglas(); cargarSugerencias();
+  }));
+}
+$("#bSugGuardar").addEventListener("click", async () => {
+  if (await guardarSugerencia($("#sugTexto").value.trim(), $("#sugAlcance").value)) $("#sugTexto").value = "";
+});
+/** Huella de lo que se envía a revisar: si no cambió, no se vuelve a gastar una consulta */
+function firmaRevision() {
+  const R = S.resultados; if (!R) return "";
+  return R.cab?.informe + "|" + filasVista(R).map(v => `${v.x?.linea?.id_gasto}:${v.campos.filter(k => !k.regla).map(k => k.c + k.st).join(",")}`).join(";");
+}
+/** Resumen compacto de los resultados para la revisión con reglas */
+function filasParaRevision(R) {
+  return filasVista(R).filter(v => v.x?.linea).map(v => {
+    const l = v.x.linea, f = v.x.factura;
+    return {
+      id_gasto: String(l.id_gasto ?? ""), numero_sap: l.numero, tipo_gasto: l.tipo_gasto, proveedor_sap: l.proveedor, fecha_gasto: l.fecha_gasto,
+      importe_sap: l.monto, moneda_sap: l.moneda || "", propina_sap: l.propina || 0, lineas_propina: (l.propinas || []).map(p => p.numero),
+      comprobante: f ? { proveedor: f.proveedor, numero: f.numero || null, fecha: f.fecha, total: f.total, propina: f.propina, impuesto: f.impuesto, moneda: f.moneda,
+        categoria: f.categoria, tiempo_comida: f.tiempo || null, personas: f.personas, es_fiscal: f.es_fiscal, observaciones_ia: f.observaciones || "" } : null,
+      resultado: v.estado, campos: v.campos.filter(k => !k.regla).map(k => ({ campo: k.c, estado: k.st, nota: k.nota || "" })),
+    };
+  });
+}
+async function aplicarReglas(manual) {
+  const R = S.resultados; if (!R) return;
+  const estado = msg => { S.reglasEstado = msg; const e = $("#reglasEstado"); if (e) e.textContent = msg; };
+  if (S.reglasRevision === undefined) await contarReglas();
+  if (!S.reglasRevision) { estado(S.sugerenciasDisponibles === false ? "falta crear la tabla de sugerencias (schema.sql)" : "no hay sugerencias activas para la revisión"); if (manual) toast("No hay sugerencias activas para la revisión. Agrégalas abajo o en la pestaña Sugerencias."); return; }
+  const firma = firmaRevision();
+  estado("aplicando reglas del equipo…");
+  for (let intento = 0; ; intento++) {
+    const r = await sb.functions.invoke(C.FUNCION_EXTRACCION, { body: { modo: "revision", filas: filasParaRevision(R) } });
+    if (!r.error) {
+      const porId = {};
+      (r.data?.observaciones || []).forEach(o => {
+        const id = String(o.id_gasto ?? "").trim(); if (!id) return;
+        (porId[id] ||= []).push({ st: o.nivel === "advertencia" ? "warn" : "na", nota: `${o.nota}${o.regla ? ` (regla ${o.regla})` : ""}` });
+      });
+      S.obsReglas = { informe: R.cab?.informe, porId, firma };
+      const n = Object.values(porId).flat().length;
+      // volver a comparar conservando las decisiones manuales
+      const previo = S.resultados;
+      S.resultados = comparar();
+      S.resultados.manual = previo.manual || {}; S.resultados.eliminadas = previo.eliminadas || {}; S.resultados._ui = previo._ui;
+      S.obsReglas.firma = firmaRevision();
+      estado(`${r.data?.reglas || 0} regla(s) aplicada(s) · ${n} observación(es)${r.data?.modelo ? " · " + r.data.modelo : ""}`);
+      renderResultados($("#resultados"), S.resultados, { editable: true });
+      cargarCapacidad();
+      return;
+    }
+    let msg = r.error.message, j = {};
+    try { j = await r.error.context.json(); msg = j.error || msg; } catch {}
+    if (r.error.context?.status === 429 && !j.diario && intento < 3) {
+      const espera = Math.min(65, j.esperar || 20) + Math.floor(Math.random() * 5);
+      estado(`IA ocupada; reintentando en ${espera} s…`);
+      await new Promise(res => setTimeout(res, espera * 1000)); continue;
+    }
+    estado("no se pudieron aplicar: " + msg);
+    if (manual) toast("No se pudieron aplicar las reglas: " + msg, 6000);
+    return;
+  }
+}
+
+/** Empieza de cero: Excel, informe, comprobantes, estado de cuenta y resultados */
+function nuevaRevision() {
+  reiniciar();
+  S.excel = { nombre: "", wb: null, hoja: "", raw: [], headerIdx: 0, headers: [], map: {} };
+  S.paisEmpresa = ""; S.monedaLocal = ""; S.regimen = "auto"; S.guardado = false;
+  $("#zExcelNom").textContent = "Ningún archivo cargado";
+  $("#excelCfg").classList.add("oculto");
+  ["#fExcel", "#fFact"].forEach(s => { const i = $(s); if (i) i.value = ""; });
+  $("#factEdit").classList.add("oculto");
+  const sr = $("#sRegimen"); if (sr) sr.value = "auto";
+  $("#dlInformes").innerHTML = ""; $("#informeInfo").textContent = "";
+  actualizarBotones();
+  toast("Lista para una nueva revisión.");
+}
 function reiniciar() {
-  S.archivos = []; S.facturas = []; S.resultados = null; S.informeId = ""; S.cab = null; S.lineas = [];
+  S.obsReglas = null; S.reglasEstado = "";
+  S.archivos = []; S.facturas = []; S.movimientos = []; S.resultados = null; S._ultimo = null; S.informeId = ""; S.cab = null; S.lineas = [];
   $("#iInforme").value = ""; $("#cabInforme").innerHTML = ""; $("#prevWrap").classList.add("oculto");
   $("#resultados").classList.add("oculto"); $("#extraerInfo").textContent = "";
   armarListaInformes(); dibujarArchivos(); dibujarFacturas(); actualizarBotones();
@@ -1697,6 +2782,7 @@ async function verRegistro(id) {
     resultados: (d.resultados || []).map(x => ({ ...x, campos: x.campos || [], notas: x.notas || [],
       linea: x.linea || (x.fila ? { numero: x.fila.numero, proveedor: x.fila.proveedor, monto: x.fila.monto, monto_local: x.fila.monto, filas: [x.fila.fila], filas_propina: [], propina: 0 } : null) })),
     limites: d.limites || [], cab: d.cab || { informe: data.informe_id }, monedaLocal: d.monedaLocal || "",
+    manual: d.manual || {}, eliminadas: d.eliminadas || {}, movimientos: d.movimientos || [],
     totalFacturas: d.totalFacturas ?? data.total_facturas, totalLineas: d.totalLineas ?? data.total_lineas, totFactLocal: d.totFactLocal, totSap: d.totSap
   }, { registro: data });
   $("#histDetalle").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1832,7 +2918,9 @@ const RPC_ADMIN = {
   clave:    d => ["admin_cambiar_clave", { p_id: d.id, p_clave: d.password }],
   nombre:   d => ["admin_nombre", { p_id: d.id, p_nombre: d.nombre }],
   bloquear: d => ["admin_bloquear", { p_id: d.id, p_bloquear: d.valor }],
-  admin:    d => ["admin_rol", { p_id: d.id, p_admin: d.valor }]
+  admin:    d => ["admin_rol", { p_id: d.id, p_admin: d.valor }],
+  eliminar: d => ["admin_eliminar_usuario", { p_id: d.id }],
+  crear:    d => ["admin_crear_usuario", { p_email: d.email, p_clave: d.password, p_nombre: d.nombre, p_modulos: d.modulos, p_admin: d.admin }]
 };
 async function llamarAdmin(op, datos = {}) {
   const [fn, args] = RPC_ADMIN[op](datos);
@@ -1846,28 +2934,41 @@ async function cargarUsuarios() {
   let lista;
   try { lista = (await llamarAdmin("listar")).usuarios; }
   catch (e) { t.innerHTML = `<tbody><tr><td><div class="aviso error">${esc(e.message)}</div></td></tr></tbody>`; return; }
+  const conModulos = PL.instalada && await cargarAsignaciones();
+  const tiene = (uid, c) => PL.asignaciones.some(a => a.user_id === uid && a.modulo === c);
+  const celdaModulos = u => !conModulos ? '<span class="mini muted">—</span>' : u.admin ? '<span class="mini muted">Todos (administrador)</span>'
+    : PL.modulos.map(m => `<label class="mod-chk" title="${esc(m.descripcion || "")}"><input type="checkbox" data-acceso="${esc(m.clave)}" ${tiene(u.id, m.clave) ? "checked" : ""}>${esc(m.nombre)}${m.activo ? "" : " (inactivo)"}</label>`).join("");
   const f = d => d ? new Date(d).toLocaleString("es-CR", { dateStyle: "short", timeStyle: "short" }) : "—";
-  t.innerHTML = `<thead><tr><th>Usuario</th><th>Rol</th><th>Estado</th><th>Último acceso</th><th>Acciones</th></tr></thead><tbody>` + lista.map(u => `
+  t.innerHTML = `<thead><tr><th>Usuario</th><th>Rol</th><th>Estado</th><th>Módulos asignados</th><th>Último acceso</th><th>Acciones</th></tr></thead><tbody>` + lista.map(u => `
     <tr data-uid="${u.id}">
       <td><b>${esc(u.nombre || "—")}</b><div class="mini muted">${esc(u.email)}</div></td>
-      <td>${u.admin ? '<span class="chip proc">Administrador</span>' : '<span class="chip na">Revisor</span>'}</td>
+      <td>${u.admin ? '<span class="chip proc">Administrador</span>' : '<span class="chip na">Usuario</span>'}</td>
       <td>${u.bloqueado ? '<span class="chip error">Bloqueado</span>' : '<span class="chip ok">Activo</span>'}</td>
+      <td>${celdaModulos(u)}</td>
       <td class="mini">${f(u.ultimo_acceso)}</td>
       <td><div class="fila" style="gap:6px">
         <button class="btn chico" data-u="clave">Cambiar contraseña</button>
         <button class="btn chico" data-u="nombre">Editar nombre</button>
         ${u.id === sesionUid ? '<span class="mini muted">(tú)</span>' : `
         <button class="btn chico" data-u="admin" data-v="${u.admin ? "" : "1"}">${u.admin ? "Quitar admin" : "Hacer admin"}</button>
-        <button class="btn chico" data-u="bloquear" data-v="${u.bloqueado ? "" : "1"}">${u.bloqueado ? "Desbloquear" : "Bloquear"}</button>`}
+        <button class="btn chico" data-u="bloquear" data-v="${u.bloqueado ? "" : "1"}">${u.bloqueado ? "Desbloquear" : "Bloquear"}</button>
+        <button class="btn chico btn-basura" data-u="eliminar" title="Eliminar usuario">🗑 Eliminar</button>`}
       </div></td></tr>`).join("") + "</tbody>";
+  $$("[data-acceso]", t).forEach(c => c.addEventListener("change", async () => {
+    c.disabled = true;
+    const ok = await cambiarAcceso(c.closest("tr").dataset.uid, c.dataset.acceso, c.checked);
+    if (!ok) c.checked = !c.checked;
+    c.disabled = false; cargarAsignaciones();
+  }));
   $$("[data-u]", t).forEach(b => b.addEventListener("click", async () => {
     const id = b.closest("tr").dataset.uid, u = lista.find(x => x.id === id), op = b.dataset.u;
     const datos = { id };
     if (op === "clave") { const c = prompt(`Nueva contraseña para ${u.email} (mínimo 8 caracteres):`); if (!c) return; if (c.length < 8) return toast("Mínimo 8 caracteres."); datos.password = c; }
     if (op === "nombre") { const n = prompt(`Nombre para ${u.email}:`, u.nombre || ""); if (n === null) return; datos.nombre = n; }
     if (op === "admin" || op === "bloquear") datos.valor = !!b.dataset.v;
+    if (op === "eliminar" && !confirm(`¿Eliminar a ${u.nombre || u.email} (${u.email})?\n\nNo podrá volver a entrar. Sus revisiones y sugerencias se conservan con su nombre. Si solo quieres impedir el acceso temporalmente, usa Bloquear.`)) return;
     b.disabled = true;
-    try { await llamarAdmin(op, datos); toast(op === "clave" ? `Contraseña de ${u.email} actualizada.` : "Cambio aplicado."); cargarUsuarios(); }
+    try { await llamarAdmin(op, datos); toast(op === "clave" ? `Contraseña de ${u.email} actualizada.` : op === "eliminar" ? `Usuario ${u.email} eliminado.` : "Cambio aplicado."); cargarUsuarios(); }
     catch (e) { toast("Error: " + e.message, 6000); b.disabled = false; }
   }));
 }
