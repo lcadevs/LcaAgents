@@ -241,6 +241,9 @@ header.modbar nav button.activo{background:none;color:var(--tinta);border-bottom
 .tile .ir{font-size:13px;font-weight:600;color:var(--primario)}
 .tile.prox{opacity:.7} .tile.prox .t-ico{background:#EEF0F2;color:var(--tenue)}
 .vacio{text-align:center;padding:40px 20px} .vacio-ico{display:inline-grid;place-items:center;width:56px;height:56px;border-radius:14px;background:#EEF0F2;color:var(--tenue);margin-bottom:10px} .vacio-ico .ico{width:28px;height:28px}
+.ir-mods{font-weight:500;color:var(--primario);text-decoration:none;margin-left:4px} .ir-mods:hover{text-decoration:underline}
+.editor-mods{display:flex;flex-direction:column;gap:10px;padding:12px 14px;background:#FAFBFC;border:1px solid var(--borde);border-radius:8px}
+.fila-mods td{background:#F7F8F9}
 .nu-mods{display:flex;flex-wrap:wrap;gap:4px 0;min-height:34px;align-items:center}
 .cred{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px;padding:10px 12px;border:1px solid var(--ok);background:var(--ok-bg);border-radius:8px;font-size:13px}
 .cred code{background:#fff;padding:2px 6px;border-radius:4px;border:1px solid var(--borde)}
@@ -576,7 +579,7 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
           <div class="fila" style="gap:6px;flex-wrap:nowrap"><input type="text" id="nuClave" minlength="8" maxlength="72" required autocomplete="new-password"><button type="button" class="btn chico" id="bGenClave" title="Generar una contraseña segura">Generar</button></div></div>
       </div>
       <div class="fila" style="margin-top:10px;align-items:center">
-        <div class="campo" style="flex:3"><label>Módulos que puede usar</label><div id="nuModulos" class="nu-mods"></div></div>
+        <div class="campo" style="flex:3"><label>Módulos que puede usar <a href="#" class="ir-mods" data-ir-modulos>· Crear o editar módulos →</a></label><div id="nuModulos" class="nu-mods"></div></div>
         <label class="check" style="flex:none"><input type="checkbox" id="nuAdmin"> Administrador (ve todos los módulos y administra la plataforma)</label>
         <button class="btn primario" type="submit" id="bCrearUsuario">Crear usuario</button>
       </div>
@@ -584,7 +587,7 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
     <div id="nuResultado"></div>
   </div>
 <div class="tarjeta">
-    <div class="fila" style="justify-content:space-between;align-items:center"><h2 style="margin:0">Usuarios</h2><button class="btn chico" id="bRefrescarUsuarios">Actualizar</button></div>
+    <div class="fila" style="justify-content:space-between;align-items:center"><div><h2 style="margin:0">Usuarios</h2><p class="sub" style="margin:2px 0 0">Para dar o quitar módulos a un usuario usa <b>Editar módulos</b> en su fila. Los administradores tienen todos.</p></div><button class="btn chico" id="bRefrescarUsuarios">Actualizar</button></div>
     <div class="scroll" style="max-height:none;margin-top:12px"><table id="tUsers"></table></div>
   </div>
 </section>
@@ -2536,6 +2539,35 @@ async function cambiarAcceso(userId, modulo, dar) {
   toast(dar ? "Módulo asignado." : "Módulo retirado.");
   return true;
 }
+/** Panel debajo de la fila del usuario para marcar sus módulos y guardar */
+function editarModulosUsuario(tr, u, tiene) {
+  const abierto = tr.nextElementSibling?.classList.contains("fila-mods");
+  $$(".fila-mods").forEach(f => f.remove());
+  if (abierto) return;
+  const fila = document.createElement("tr"); fila.className = "fila-mods";
+  fila.innerHTML = `<td colspan="6"><div class="editor-mods">
+    <b>Módulos de ${esc(u.nombre || u.email)}</b>
+    <div class="nu-mods">${PL.modulos.map(m => `<label class="mod-chk" title="${esc(m.descripcion || "")}"><input type="checkbox" data-em="${esc(m.clave)}" ${tiene(u.id, m.clave) ? "checked" : ""}>${esc(m.nombre)}${m.activo ? "" : " <span class='muted'>(inactivo)</span>"}</label>`).join("") || '<span class="muted mini">No hay módulos: créalos en la pestaña Módulos.</span>'}</div>
+    <div class="fila" style="gap:8px"><button class="btn primario chico" data-em-guardar>Guardar</button><button class="btn chico" data-em-cancelar>Cancelar</button>
+      <a href="#" class="ir-mods" data-ir-modulos>Crear o editar módulos →</a></div></div></td>`;
+  tr.after(fila);
+  $("[data-em-cancelar]", fila).addEventListener("click", () => fila.remove());
+  $("[data-em-guardar]", fila).addEventListener("click", async e => {
+    const b = e.currentTarget; b.disabled = true; b.textContent = "Guardando…";
+    let errores = 0, cambios = 0;
+    for (const c of $$("[data-em]", fila)) {
+      const antes = tiene(u.id, c.dataset.em);
+      if (c.checked === antes) continue;
+      const { error } = c.checked
+        ? await sb.from("usuario_modulos").insert({ user_id: u.id, modulo: c.dataset.em })
+        : await sb.from("usuario_modulos").delete().eq("user_id", u.id).eq("modulo", c.dataset.em);
+      if (error) { errores++; console.warn(error); } else cambios++;
+    }
+    toast(errores ? `Se guardaron ${cambios} cambio(s); ${errores} fallaron.` : cambios ? `Módulos de ${u.nombre || u.email} actualizados. Los verá la próxima vez que entre o recargue.` : "Sin cambios.", errores ? 6000 : 3800);
+    cargarUsuarios();
+  });
+}
+
 /* ---------- Crear usuario ---------- */
 function generarClave() {
   const abc = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789", sim = "!@#$%*?";
@@ -2550,6 +2582,7 @@ function dibujarFormUsuario() {
     || '<span class="mini muted">No hay módulos activos.</span>';
   if (!$("#nuClave").value) $("#nuClave").value = generarClave();
 }
+document.addEventListener("click", e => { if (e.target.closest("[data-ir-modulos]")) { e.preventDefault(); abrirAdmin("modulos"); } });
 $("#bGenClave").addEventListener("click", () => { $("#nuClave").value = generarClave(); });
 $("#nuAdmin").addEventListener("change", e => $$("[data-nu-mod]").forEach(c => { c.disabled = e.target.checked; }));
 $("#fNuevoUsuario").addEventListener("submit", async e => {
@@ -2936,8 +2969,10 @@ async function cargarUsuarios() {
   catch (e) { t.innerHTML = `<tbody><tr><td><div class="aviso error">${esc(e.message)}</div></td></tr></tbody>`; return; }
   const conModulos = PL.instalada && await cargarAsignaciones();
   const tiene = (uid, c) => PL.asignaciones.some(a => a.user_id === uid && a.modulo === c);
-  const celdaModulos = u => !conModulos ? '<span class="mini muted">—</span>' : u.admin ? '<span class="mini muted">Todos (administrador)</span>'
-    : PL.modulos.map(m => `<label class="mod-chk" title="${esc(m.descripcion || "")}"><input type="checkbox" data-acceso="${esc(m.clave)}" ${tiene(u.id, m.clave) ? "checked" : ""}>${esc(m.nombre)}${m.activo ? "" : " (inactivo)"}</label>`).join("");
+  const celdaModulos = u => !conModulos ? '<span class="mini" style="color:var(--warn)">Falta ejecutar el schema.sql nuevo</span>'
+    : u.admin ? '<span class="chip proc">Todos (administrador)</span>'
+    : (PL.modulos.filter(m => tiene(u.id, m.clave)).map(m => `<span class="chip ${m.activo ? "ok" : "na"}" style="margin:0 4px 4px 0">${esc(m.nombre)}${m.activo ? "" : " (inactivo)"}</span>`).join("")
+       || '<span class="chip warn">Sin módulos</span>');
   const f = d => d ? new Date(d).toLocaleString("es-CR", { dateStyle: "short", timeStyle: "short" }) : "—";
   t.innerHTML = `<thead><tr><th>Usuario</th><th>Rol</th><th>Estado</th><th>Módulos asignados</th><th>Último acceso</th><th>Acciones</th></tr></thead><tbody>` + lista.map(u => `
     <tr data-uid="${u.id}">
@@ -2947,6 +2982,7 @@ async function cargarUsuarios() {
       <td>${celdaModulos(u)}</td>
       <td class="mini">${f(u.ultimo_acceso)}</td>
       <td><div class="fila" style="gap:6px">
+        ${conModulos && !u.admin ? '<button class="btn chico primario" data-u="modulos">Editar módulos</button>' : ""}
         <button class="btn chico" data-u="clave">Cambiar contraseña</button>
         <button class="btn chico" data-u="nombre">Editar nombre</button>
         ${u.id === sesionUid ? '<span class="mini muted">(tú)</span>' : `
@@ -2954,14 +2990,9 @@ async function cargarUsuarios() {
         <button class="btn chico" data-u="bloquear" data-v="${u.bloqueado ? "" : "1"}">${u.bloqueado ? "Desbloquear" : "Bloquear"}</button>
         <button class="btn chico btn-basura" data-u="eliminar" title="Eliminar usuario">🗑 Eliminar</button>`}
       </div></td></tr>`).join("") + "</tbody>";
-  $$("[data-acceso]", t).forEach(c => c.addEventListener("change", async () => {
-    c.disabled = true;
-    const ok = await cambiarAcceso(c.closest("tr").dataset.uid, c.dataset.acceso, c.checked);
-    if (!ok) c.checked = !c.checked;
-    c.disabled = false; cargarAsignaciones();
-  }));
   $$("[data-u]", t).forEach(b => b.addEventListener("click", async () => {
     const id = b.closest("tr").dataset.uid, u = lista.find(x => x.id === id), op = b.dataset.u;
+    if (op === "modulos") return editarModulosUsuario(b.closest("tr"), u, tiene);
     const datos = { id };
     if (op === "clave") { const c = prompt(`Nueva contraseña para ${u.email} (mínimo 8 caracteres):`); if (!c) return; if (c.length < 8) return toast("Mínimo 8 caracteres."); datos.password = c; }
     if (op === "nombre") { const n = prompt(`Nombre para ${u.email}:`, u.nombre || ""); if (n === null) return; datos.nombre = n; }
