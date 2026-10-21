@@ -1,0 +1,1879 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revisor de Gastos SAP</title>
+<script>
+/* =====================================================================
+   CONFIGURACIÓN — edita solo este bloque
+   Las políticas (límites, tipos de cambio, países) se editan en la
+   pestaña "Políticas" y quedan guardadas en Supabase. Los valores de
+   abajo solo se usan si todavía no hay nada guardado.
+   ===================================================================== */
+window.CONFIG = {
+  SUPABASE_URL: "https://xwubyhcupjgepqlqthxq.supabase.co",
+  SUPABASE_ANON_KEY: "sb_publishable_NTNuTWZnn9Sn-xWKqjfeQA_BpXlP2xP",   // llave publishable (pública, protegida por RLS)
+  // Cómo se leen las facturas:
+  //  "automatico" → la Edge Function lee cada página con IA (Gemini gratis por defecto, o Claude si se configura)
+  //  "copilot"    → manual: la app prepara cada página como imagen y el usuario la pasa por Copilot Chat
+  MODO_LECTURA: "automatico",
+  URL_COPILOT: "https://m365.cloud.microsoft/chat",
+  FUNCION_EXTRACCION: "extraer-factura",
+  TABLA: "revisiones",
+  TABLA_PARAMETROS: "parametros",
+
+  // Procesamiento de facturas
+  DIVIDIR_PDF_POR_PAGINA: true,     // cada página se lee por separado (más rápido y confiable)
+  PROCESOS_SIMULTANEOS: 2,         // Gemini gratis permite ~15 lecturas por minuto
+  REINTENTOS_LIMITE: 4,             // reintentos automáticos cuando la IA pide esperar (límite por minuto)
+  MAX_MB_ARCHIVO: 40,
+  MAX_PX_IMAGEN: 2200,
+
+  // Los sufijos de las líneas de propina en SAP (-P, -A…) se configuran en la pestaña Políticas
+
+  // Columnas del reporte de SAP ByD (se detectan solas; el primer nombre es el exacto del export)
+  ALIAS_COLUMNAS: {
+    informe:         ["informe de gastos", "no informe", "id informe", "expense report"],
+    numero:          ["id factura", "factura", "no factura", "numero factura", "invoice", "invoice number", "comprobante"],
+    proveedor:       ["proveedor", "vendor", "supplier", "comercio", "merchant"],
+    monto:           ["importe de gastos", "importe", "monto", "amount"],
+    monto_local:     ["importe de gastos moneda local", "importe moneda local", "moneda local", "local amount"],
+    impuesto:        ["importe de impuesto", "impuesto", "iva", "tax amount"],
+    codigo_impuesto: ["codigo de impuesto", "tax code"],
+    empleado:        ["informe de gastos empleado", "empleado", "employee"],
+    texto:           ["informe de gastos texto", "texto", "descripcion"],
+    empresa:         ["informe de gastos empresa texto", "empresa texto", "company name"],
+    empresa_cod:     ["informe de gastos empresa", "empresa", "company"],
+    pais:            ["informe de gastos pais region", "pais region", "pais", "country"],
+    estado:          ["informe de gastos estado", "estado"],
+    fecha_cont:      ["informe de gastos fecha de contabilizacion", "fecha de contabilizacion", "posting date"],
+    aprobador:       ["aprobador informe de gastos", "aprobador", "approver"],
+    fecha_gasto:     ["fecha de gasto", "fecha gasto", "expense date"],
+    id_gasto:        ["id de gastos", "id de gasto", "id gasto", "expense id"],
+    finalidad:       ["finalidad", "purpose"]
+  },
+
+  POLITICA_DEFECTO: {
+    general: {
+      tol_monto_abs: 1.00,          // diferencia aceptada en la misma moneda
+      tol_monto_pct: 2,             // % hasta donde es advertencia
+      tol_tc_pct: 4,                // % de desviación aceptada contra el tipo de cambio de referencia
+      propina_max_pct: 10,          // propina máxima sobre el consumo
+      confianza_minima: 0.75,
+      tol_fecha_dias: 1,
+      sufijos_propina: ["*"],       // "*" = cualquier sufijo de letras (-P, -A, -S…) cuando existe la factura base; o una lista: ["P", "A"]            // días de diferencia aceptados (advertencia) entre la factura y la "Fecha de gasto" de SAP
+      desayuno_hasta: "10:59",
+      almuerzo_hasta: "16:59",
+      almuerzo_cena_modo: "dia",    // "dia": el monto de almuerzo y cena es un tope diario conjunto; "comida": tope por cada comida
+      por_persona: true,            // si la factura indica varias personas, el límite se aplica por persona
+      nacional_por_defecto: "gira"  // facturas del mismo país de la empresa: "gira" (por día) o "viaticos" (por tiempo de comida)
+    },
+    nacional: {
+      viaticos_comida:       { concepto: "Alimentación viáticos por tiempo de comida", monto: 20,  moneda: "USD", incluye: false },
+      gira_alimentacion_dia: { concepto: "Alimentación giras por día",                monto: 60,  moneda: "USD", incluye: false },
+      gira_hospedaje_noche:  { concepto: "Hospedaje giras (por noche)",               monto: 120, moneda: "USD", incluye: false },
+      backoffice_comida:     { concepto: "Alimentación back-office (por comida)",     monto: 15,  moneda: "USD", incluye: true }
+    },
+    viajes_hospedaje: [
+      { region: "Europa",          monto: 300, moneda: "EUR", paises: ["España", "Francia", "Italia", "Alemania", "Portugal", "Reino Unido", "Países Bajos", "Bélgica", "Suiza", "Austria", "Irlanda", "Polonia", "Grecia", "Suecia", "Dinamarca", "Noruega", "Finlandia", "República Checa"] },
+      { region: "Caribe",          monto: 250, moneda: "USD", paises: ["Jamaica", "Puerto Rico", "Cuba", "Haití", "Bahamas", "Trinidad y Tobago", "Barbados", "Aruba", "Curazao"] },
+      { region: "Dominicana",      monto: 250, moneda: "USD", paises: ["República Dominicana"] },
+      { region: "América Central", monto: 200, moneda: "USD", paises: ["Guatemala", "El Salvador", "Honduras", "Nicaragua", "Costa Rica", "Panamá", "Belice"] },
+      { region: "USA",             monto: 300, moneda: "USD", paises: ["Estados Unidos"] },
+      { region: "México",          monto: 200, moneda: "USD", paises: ["México"] },
+      { region: "América del Sur", monto: 200, moneda: "USD", paises: ["Colombia", "Ecuador", "Perú", "Chile", "Argentina", "Brasil", "Bolivia", "Paraguay", "Uruguay", "Venezuela"] }
+    ],
+    viajes_alimentacion: [
+      { region: "Centroamérica-Suramérica", desayuno: 30, almuerzo_cena: 100, moneda: "USD", paises: ["Guatemala", "El Salvador", "Honduras", "Nicaragua", "Costa Rica", "Belice", "México", "Colombia", "Ecuador", "Perú", "Chile", "Argentina", "Brasil", "Bolivia", "Paraguay", "Uruguay", "Venezuela"] },
+      { region: "Caribe-Panamá",            desayuno: 30, almuerzo_cena: 120, moneda: "USD", paises: ["Panamá", "República Dominicana", "Jamaica", "Puerto Rico", "Cuba", "Haití", "Bahamas", "Trinidad y Tobago", "Barbados", "Aruba", "Curazao"] },
+      { region: "EEUU",                     desayuno: 40, almuerzo_cena: 150, moneda: "USD", paises: ["Estados Unidos"] },
+      { region: "Europa",                   desayuno: 40, almuerzo_cena: 150, moneda: "EUR", paises: ["España", "Francia", "Italia", "Alemania", "Portugal", "Reino Unido", "Países Bajos", "Bélgica", "Suiza", "Austria", "Irlanda", "Polonia", "Grecia", "Suecia", "Dinamarca", "Noruega", "Finlandia", "República Checa"] }
+    ],
+    // Unidades de cada moneda por 1 USD. VALORES DE EJEMPLO: actualízalos en la pestaña Políticas.
+    tipos_cambio: [
+      { moneda: "USD", por_usd: 1 },     { moneda: "EUR", por_usd: 0.86 }, { moneda: "CRC", por_usd: 445 },
+      { moneda: "GTQ", por_usd: 7.65 },  { moneda: "HNL", por_usd: 26.4 }, { moneda: "NIO", por_usd: 36.7 },
+      { moneda: "DOP", por_usd: 63 },    { moneda: "MXN", por_usd: 18.5 }, { moneda: "COP", por_usd: 4000 }
+    ],
+    fecha_tipos_cambio: "",
+    paises: [
+      { pais: "Costa Rica",           moneda: "CRC", iva_pct: 13, codigos: ["BT", "CR"], iva_desglosado: true },
+      { pais: "Guatemala",            moneda: "GTQ", iva_pct: 12, codigos: ["GT"], iva_desglosado: true },
+      { pais: "El Salvador",          moneda: "USD", iva_pct: 13, codigos: ["SV"], iva_desglosado: true },
+      { pais: "Honduras",             moneda: "HNL", iva_pct: 15, codigos: ["HN"], iva_desglosado: true },
+      { pais: "Nicaragua",            moneda: "NIO", iva_pct: 15, codigos: ["NI"], iva_desglosado: true },
+      { pais: "Panamá",               moneda: "USD", iva_pct: 7,  codigos: ["PA"], iva_desglosado: true },
+      { pais: "República Dominicana", moneda: "DOP", iva_pct: 18, codigos: ["DO", "RD"], iva_desglosado: true },
+      { pais: "Ecuador",              moneda: "USD", iva_pct: 15, codigos: ["EC"], iva_desglosado: true },
+      { pais: "México",               moneda: "MXN", iva_pct: 16, codigos: ["MX"], iva_desglosado: true },
+      { pais: "Estados Unidos",       moneda: "USD", iva_pct: 0,  codigos: ["US"], iva_desglosado: true },
+      { pais: "Colombia",             moneda: "COP", iva_pct: 19, codigos: ["CO"], iva_desglosado: true }
+    ]
+  }
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+:root{
+  --primario:#E30613; --primario-osc:#B8050F; --tinta:#1F2328; --tinta-2:#4A5059; --tenue:#7A818B;
+  --fondo:#F4F5F7; --tarjeta:#FFFFFF; --borde:#DFE2E6;
+  --ok:#1E8E3E; --ok-bg:#E6F4EA; --warn:#B26A00; --warn-bg:#FFF4E0; --err:#C5221F; --err-bg:#FCE8E6; --na:#6B7280; --na-bg:#EFF1F3;
+  --radio:10px; --sombra:0 1px 2px rgba(0,0,0,.06),0 2px 8px rgba(0,0,0,.04);
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:"Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif;background:var(--fondo);color:var(--tinta);font-size:14px;line-height:1.45}
+button,input,select,textarea{font:inherit}
+.oculto{display:none!important}
+header{background:var(--tinta);color:#fff;padding:0 20px;height:56px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:10}
+header .marca{display:flex;align-items:center;gap:10px;font-weight:600;font-size:16px;white-space:nowrap}
+header .marca i{width:10px;height:26px;background:var(--primario);border-radius:2px;display:inline-block}
+header nav{display:flex;gap:4px;margin-left:16px;overflow-x:auto}
+header nav button{background:none;border:0;color:#C9CDD2;padding:8px 14px;border-radius:6px;cursor:pointer;white-space:nowrap}
+header nav button.activo{background:rgba(255,255,255,.12);color:#fff}
+header .usuario{margin-left:auto;display:flex;align-items:center;gap:10px;color:#C9CDD2;font-size:13px}
+main{max-width:1360px;margin:0 auto;padding:20px}
+.tarjeta{background:var(--tarjeta);border:1px solid var(--borde);border-radius:var(--radio);box-shadow:var(--sombra);padding:18px;margin-bottom:16px}
+.tarjeta h2{margin:0 0 4px;font-size:16px;display:flex;align-items:center;gap:8px}
+.tarjeta h3{margin:18px 0 6px;font-size:14px}
+.tarjeta h2 .paso{background:var(--primario);color:#fff;width:22px;height:22px;border-radius:50%;font-size:12px;display:inline-flex;align-items:center;justify-content:center;flex:none}
+.sub{color:var(--tenue);margin:0 0 14px;font-size:13px}
+.fila{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.campo{display:flex;flex-direction:column;gap:4px;min-width:150px;flex:1}
+.campo label{font-size:12px;color:var(--tinta-2);font-weight:600}
+input[type=text],input[type=email],input[type=password],input[type=number],input[type=date],input[type=time],select,textarea{border:1px solid var(--borde);border-radius:6px;padding:7px 9px;background:#fff;color:var(--tinta);width:100%}
+input:focus,select:focus,textarea:focus{outline:2px solid rgba(227,6,19,.25);border-color:var(--primario)}
+input:disabled,select:disabled{background:#F4F5F7;color:var(--tinta-2)}
+.btn{border:1px solid var(--borde);background:#fff;color:var(--tinta);padding:8px 14px;border-radius:6px;cursor:pointer;font-weight:600;white-space:nowrap}
+.btn:hover{background:#F7F8F9}
+.btn.primario{background:var(--primario);border-color:var(--primario);color:#fff}
+.btn.primario:hover{background:var(--primario-osc)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.chico{padding:4px 9px;font-size:12px}
+.zona{border:2px dashed var(--borde);border-radius:var(--radio);padding:22px;text-align:center;color:var(--tinta-2);cursor:pointer;transition:.15s;background:#FAFBFC}
+.zona:hover,.zona.sobre{border-color:var(--primario);background:#FFF5F5}
+.zona b{color:var(--primario)}
+.zona small{display:block;color:var(--tenue);margin-top:4px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:7px 8px;border-bottom:1px solid var(--borde);text-align:left;vertical-align:top}
+th{background:#F7F8F9;font-size:12px;color:var(--tinta-2);font-weight:600;position:sticky;top:0;z-index:1;white-space:nowrap}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.scroll{overflow:auto;max-height:440px;border:1px solid var(--borde);border-radius:6px}
+.chip{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+.chip.ok{background:var(--ok-bg);color:var(--ok)} .chip.warn{background:var(--warn-bg);color:var(--warn)}
+.chip.error{background:var(--err-bg);color:var(--err)} .chip.na{background:var(--na-bg);color:var(--na)}
+.chip.proc{background:#E8F0FE;color:#1A56C4}
+.resumen{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:14px}
+.kpi{border:1px solid var(--borde);border-radius:8px;padding:12px;background:#fff}
+.kpi .v{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums}
+.kpi .l{font-size:12px;color:var(--tenue)}
+.kpi.ok .v{color:var(--ok)} .kpi.warn .v{color:var(--warn)} .kpi.error .v{color:var(--err)}
+.det{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px}
+.det .chip{font-weight:500;white-space:normal}
+.notas{margin:4px 0 0;padding-left:16px;color:var(--tinta-2);font-size:12px}
+.lista-archivos{display:flex;flex-direction:column;gap:6px;margin-top:12px;max-height:300px;overflow:auto}
+.archivo{display:flex;align-items:center;gap:10px;border:1px solid var(--borde);border-radius:6px;padding:6px 10px;background:#fff}
+.archivo .n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.archivo .err{color:var(--err);font-size:12px}
+.edit input,.edit select{padding:4px 6px;font-size:12px}
+.filtros{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.filtros button.activo{border-color:var(--primario);color:var(--primario)}
+.login{max-width:380px;margin:80px auto}
+.login .tarjeta{padding:26px}
+.aviso{padding:10px 12px;border-radius:6px;background:var(--warn-bg);color:#6B4100;font-size:13px;margin-bottom:12px}
+.aviso.error{background:var(--err-bg);color:#8C1411}
+.aviso.info{background:#E8F0FE;color:#1A3D7C}
+.toast{position:fixed;bottom:20px;right:20px;background:var(--tinta);color:#fff;padding:10px 16px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.2);z-index:50;max-width:440px}
+.muted{color:var(--tenue)} .mini{font-size:12px}
+.barra{height:6px;background:var(--borde);border-radius:3px;overflow:hidden;margin-top:10px}
+.barra i{display:block;height:100%;background:var(--primario);width:0;transition:width .3s}
+.mapa{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin:12px 0}
+.cab{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 16px;background:#FAFBFC;border:1px solid var(--borde);border-radius:8px;padding:12px;margin-top:12px}
+.cab div{font-size:13px} .cab b{display:block;font-size:11px;color:var(--tenue);font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+.informe-box{border:2px solid var(--primario);border-radius:8px;padding:14px;margin-top:14px;background:#FFF8F8}
+details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13px;margin-top:12px}
+.pol-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.check{display:flex;align-items:center;gap:8px;font-size:13px}
+.guia{background:#F7F8F9;border:1px solid var(--borde);border-radius:8px;padding:12px 14px;margin-bottom:12px;font-size:13px}
+.guia ol{margin:6px 0 10px;padding-left:20px} .guia li{margin-bottom:3px}
+.pagina{display:flex;gap:12px;border:1px solid var(--borde);border-radius:8px;padding:10px;background:#fff}
+.pagina .thumb{width:110px;height:150px;object-fit:cover;object-position:top;border:1px solid var(--borde);border-radius:4px;cursor:zoom-in;flex:none}
+.pagina .pag-body{flex:1;min-width:0}
+.pagina textarea{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.lista-archivos.copilot{max-height:none;gap:10px}
+@media (max-width:720px){.pagina{flex-direction:column}.pagina .thumb{width:100%;height:200px}}
+@media (max-width:720px){header{padding:0 10px}header .marca span{display:none}header nav{margin-left:0}header .usuario span{display:none}main{padding:12px}}
+</style>
+</head>
+<body>
+
+<!-- ============ LOGIN ============ -->
+<div id="vLogin" class="login oculto">
+  <div class="tarjeta">
+    <h2 style="font-size:18px">Revisor de Gastos SAP</h2>
+    <p class="sub">Ingresa con tu cuenta del equipo.</p>
+    <div id="loginMsg"></div>
+    <form id="fLogin">
+      <div class="campo" style="margin-bottom:10px"><label>Correo</label><input type="email" id="lEmail" required autocomplete="username"></div>
+      <div class="campo" style="margin-bottom:14px"><label>Contraseña</label><input type="password" id="lPass" required autocomplete="current-password"></div>
+      <button class="btn primario" style="width:100%" type="submit">Ingresar</button>
+    </form>
+    <p class="mini muted" style="margin-top:12px"><a href="#" id="lOlvido">¿Olvidaste tu contraseña?</a></p>
+  </div>
+</div>
+
+<!-- ============ APP ============ -->
+<div id="vApp" class="oculto">
+<header>
+  <div class="marca"><i></i><span>Revisor de Gastos SAP</span></div>
+  <nav>
+    <button data-tab="nueva" class="activo">Nueva revisión</button>
+    <button data-tab="historial">Historial</button>
+    <button data-tab="politicas">Políticas</button>
+    <button data-tab="usuarios" id="navUsuarios" class="oculto">Usuarios</button>
+  </nav>
+  <div class="usuario"><span id="uEmail"></span><button class="btn chico" id="bMiClave" title="Cambiar mi contraseña">Mi contraseña</button><button class="btn chico" id="bSalir">Salir</button></div>
+</header>
+
+<main>
+<!-- ===== NUEVA REVISIÓN ===== -->
+<section id="tNueva">
+  <div class="tarjeta">
+    <h2><span class="paso">1</span>Reporte de informes de gastos (Excel de SAP)</h2>
+    <p class="sub">Sube el reporte exportado de SAP ByD y escribe el número de informe que vas a revisar. Solo se comparan las líneas de ese informe.</p>
+    <div class="zona" id="zExcel"><b>Selecciona</b> o arrastra el archivo .xlsx / .xls / .csv<small id="zExcelNom">Ningún archivo cargado</small></div>
+    <input type="file" id="fExcel" accept=".xlsx,.xls,.xlsm,.csv" class="oculto">
+    <div id="excelCfg" class="oculto">
+      <div class="informe-box">
+        <div class="fila">
+          <div class="campo" style="max-width:260px"><label>No. de informe de gastos <span style="color:var(--primario)">*</span></label>
+            <input type="text" id="iInforme" list="dlInformes" placeholder="Ej. 14062" autocomplete="off"></div>
+          <div class="mini muted" id="informeInfo" style="padding-bottom:8px;flex:2"></div>
+        </div>
+        <datalist id="dlInformes"></datalist>
+        <div id="cabInforme"></div>
+      </div>
+      <details id="detMapa">
+        <summary>Mapeo de columnas del Excel (detectado automáticamente)</summary>
+        <div class="fila" style="margin-top:10px">
+          <div class="campo" style="max-width:240px"><label>Hoja</label><select id="sHoja"></select></div>
+          <div class="campo" style="max-width:160px"><label>Fila de encabezados</label><input type="number" id="iHeader" min="1"></div>
+          <div class="mini muted" id="excelInfo" style="padding-bottom:8px"></div>
+        </div>
+        <div class="mapa" id="mapa"></div>
+      </details>
+      <div id="prevWrap" class="oculto" style="margin-top:12px">
+        <div class="mini muted" style="margin-bottom:6px">Líneas del informe (las propinas <b>-P</b> se agrupan con su factura)</div>
+        <div class="scroll" style="max-height:260px"><table id="tPrev"></table></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tarjeta">
+    <h2><span class="paso">2</span>Facturas (escaneos o fotos)</h2>
+    <p class="sub">PDF, JPG, PNG o WEBP. Los PDF se leen página por página y cada página puede traer varios tiquetes.</p>
+    <div class="guia oculto" id="guiaCopilot">
+      <b>Lectura con Copilot Chat (gratis)</b>
+      <ol>
+        <li>Sube aquí el PDF o las fotos: la app separa cada página en una imagen.</li>
+        <li>Presiona <b>Copiar instrucciones</b>, abre Copilot Chat (verifica el escudo verde de protección empresarial) y pega las instrucciones.</li>
+        <li>En cada página presiona <b>Copiar imagen</b> y pégala en Copilot con Ctrl+V (o arrastra el JPG descargado) y envía.</li>
+        <li>Copia el bloque de código que responde Copilot (botón <i>Copiar</i> del bloque) y pégalo en la casilla de esa página → <b>Agregar comprobantes</b>.</li>
+      </ol>
+      <div class="mini muted" style="margin-bottom:8px">Tip: usa la misma conversación para todas las páginas; después de la primera basta con pegar la siguiente imagen y enviar.</div>
+      <div class="fila"><button class="btn primario chico" id="bCopiarPrompt">Copiar instrucciones para Copilot</button>
+        <a class="btn chico" id="aCopilot" target="_blank" rel="noopener">Abrir Copilot Chat ↗</a></div>
+    </div>
+    <div class="zona" id="zFact"><b>Selecciona</b> o arrastra las facturas<small>Se leen con IA; podrás corregir cualquier dato antes de comparar</small></div>
+    <input type="file" id="fFact" accept=".pdf,image/jpeg,image/png,image/webp" multiple class="oculto">
+    <div class="lista-archivos" id="listaArch"></div>
+    <div class="fila" style="margin-top:12px">
+      <button class="btn primario" id="bExtraer" disabled>Leer facturas</button>
+      <span class="mini muted" id="extraerInfo"></span>
+    </div>
+    <div class="barra oculto" id="barra"><i></i></div>
+    <div id="factEdit" class="oculto" style="margin-top:16px">
+      <div class="mini muted" style="margin-bottom:6px">Datos leídos. <b>Total</b> = total de la factura sin propina. Corrige cualquier celda; la categoría y la comida definen qué límite aplica.</div>
+      <div class="scroll edit" style="max-height:520px"><table id="tFact"></table></div>
+      <div class="fila" style="margin-top:8px"><button class="btn chico" id="bAgregarManual">+ Agregar factura manualmente</button></div>
+    </div>
+  </div>
+
+  <div class="tarjeta">
+    <h2><span class="paso">3</span>Comparación y control de límites</h2>
+    <p class="sub">Se emparejan facturas con líneas del informe por número, monto (con conversión de moneda) y proveedor, y se validan los límites de la política.</p>
+    <div class="fila">
+      <div class="campo" style="max-width:340px"><label>Régimen de política</label>
+        <select id="sRegimen">
+          <option value="auto">Automático (por país de la factura)</option>
+          <option value="viaje">Viaje internacional</option>
+          <option value="gira">Gira nacional (alimentación por día)</option>
+          <option value="viaticos">Viáticos (por tiempo de comida)</option>
+          <option value="backoffice">Back-office</option>
+        </select></div>
+      <button class="btn primario" id="bComparar" disabled>Comparar</button>
+      <span class="mini muted" id="compInfo" style="padding-bottom:8px"></span>
+    </div>
+  </div>
+
+  <div id="resultados" class="oculto"></div>
+</section>
+
+<!-- ===== HISTORIAL ===== -->
+<section id="tHistorial" class="oculto">
+  <div class="tarjeta">
+    <h2>Historial de revisiones</h2>
+    <p class="sub">Todas las revisiones guardadas por el equipo.</p>
+    <div class="fila" style="margin-bottom:12px">
+      <div class="campo"><label>Buscar (informe, colaborador o referencia)</label><input type="text" id="hBuscar" placeholder="14062, nombre…"></div>
+      <div class="campo" style="max-width:200px"><label>Dictamen</label>
+        <select id="hEstado"><option value="">Todos</option><option value="aprobado">Aprobado</option><option value="con_observaciones">Con observaciones</option><option value="rechazado">Rechazado</option></select>
+      </div>
+      <button class="btn" id="hRefrescar">Buscar</button>
+    </div>
+    <div class="scroll" style="max-height:none"><table id="tHist"></table></div>
+  </div>
+  <div id="histDetalle"></div>
+</section>
+
+<!-- ===== POLÍTICAS ===== -->
+<section id="tPoliticas" class="oculto">
+  <div class="tarjeta">
+    <div class="fila" style="justify-content:space-between;align-items:center">
+      <div><h2>Políticas de gastos</h2><p class="sub" id="polSub" style="margin:0"></p></div>
+      <div class="fila">
+        <button class="btn" id="bPolDefecto">Restaurar valores por defecto</button>
+        <button class="btn primario" id="bPolGuardar">Guardar políticas</button>
+      </div>
+    </div>
+    <div id="polAviso"></div>
+    <h3>Parámetros generales</h3><div id="polGeneral" class="pol-grid"></div>
+    <h3>Montos autorizados para viáticos, giras y back-office</h3>
+    <p class="sub">"Incluye IVA y propina" desmarcado = el límite se compara contra el consumo neto (sin IVA ni propina).</p>
+    <div id="polNacional"></div>
+    <h3>Viajes: hospedaje por noche (no incluye IVA ni propina)</h3><div id="polHosp"></div>
+    <h3>Viajes: alimentación (no incluye IVA ni propina)</h3><div id="polAlim"></div>
+    <h3>Tipos de cambio de referencia (unidades por 1 USD)</h3>
+    <div class="fila" style="margin-bottom:8px"><div class="campo" style="max-width:260px"><label>Fecha / fuente de los tipos de cambio</label><input type="text" id="polFechaTc" placeholder="Ej. BCCR / Banguat 21-10-2026"></div></div>
+    <div id="polTc"></div>
+    <h3>Países: moneda local, IVA y códigos de empresa en SAP</h3><div id="polPaises"></div>
+  </div>
+  <div class="tarjeta">
+    <h2>Historial de cambios de políticas</h2>
+    <p class="sub">Registro automático de quién cambió qué y cuándo. No se puede editar ni borrar.</p>
+    <div class="scroll" style="max-height:420px"><table id="tPolHist"></table></div>
+  </div>
+</section>
+
+<!-- ===== USUARIOS (solo administradores) ===== -->
+<section id="tUsuarios" class="oculto">
+  <div class="tarjeta">
+    <h2>Crear o eliminar usuarios</h2>
+    <p class="sub" style="margin:0">Se hace en el panel de Supabase: <b>Authentication → Users → Add user → Create new user</b> (marca <i>Auto Confirm User</i>). El usuario aparece aquí al actualizar, y desde esta pantalla le asignas nombre, rol y contraseña o lo bloqueas.</p>
+  </div>
+  <div class="tarjeta">
+    <div class="fila" style="justify-content:space-between;align-items:center"><h2 style="margin:0">Usuarios</h2><button class="btn chico" id="bRefrescarUsuarios">Actualizar</button></div>
+    <div class="scroll" style="max-height:none;margin-top:12px"><table id="tUsers"></table></div>
+  </div>
+</section>
+</main>
+</div>
+
+<div id="toast" class="toast oculto"></div>
+
+<script>
+"use strict";
+/* =====================================================================
+   UTILIDADES
+   ===================================================================== */
+const C = window.CONFIG;
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmtNum = new Intl.NumberFormat("es-CR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const money = v => (v === null || v === undefined || isNaN(v)) ? "—" : fmtNum.format(v);
+const mm = (m, v) => (v === null || v === undefined || isNaN(v)) ? "—" : `${m ? m + " " : ""}${fmtNum.format(v)}`;
+const uid = () => Math.random().toString(36).slice(2, 10);
+const clonar = o => JSON.parse(JSON.stringify(o));
+const sinAcentos = s => String(s ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "");
+const normTxt = s => sinAcentos(s).toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+const rel = (a, b) => Math.abs(a - b) / Math.max(Math.abs(b), 1e-9);
+
+function toast(msg, ms = 3800) {
+  const t = $("#toast"); t.textContent = msg; t.classList.remove("oculto");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.add("oculto"), ms);
+}
+function lsGet(k, def) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; } catch { return def; } }
+function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+
+/** "₡1.234,56", "1,234.56", "(150.00)", "12.500" → número */
+function parseNum(v) {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "number") return isFinite(v) ? v : null;
+  let s = String(v).trim();
+  const neg = /^\(.*\)$/.test(s) || /^-/.test(s) || /-$/.test(s);
+  s = s.replace(/[^\d.,]/g, "");
+  if (!s) return null;
+  const lastDot = s.lastIndexOf("."), lastCom = s.lastIndexOf(",");
+  if (lastDot > -1 && lastCom > -1) {
+    const dec = lastDot > lastCom ? "." : ",";
+    s = s.split(dec === "." ? "," : ".").join("").replace(dec, ".");
+  } else if (lastCom > -1) {
+    s = /,\d{1,2}$/.test(s) && (s.match(/,/g) || []).length === 1 ? s.replace(",", ".") : s.replace(/,/g, "");
+  } else if ((s.match(/\./g) || []).length > 1 || /^\d{1,3}\.\d{3}$/.test(s)) {
+    s = s.replace(/\./g, "");
+  }
+  const n = parseFloat(s);
+  return isNaN(n) ? null : (neg ? -Math.abs(n) : n);
+}
+const pad = n => String(n).padStart(2, "0");
+function parseFecha(v) {
+  if (v === null || v === undefined || v === "") return null;
+  if (v instanceof Date && !isNaN(v)) return `${v.getFullYear()}-${pad(v.getMonth() + 1)}-${pad(v.getDate())}`;
+  if (typeof v === "number" && v > 20000 && v < 80000) { const d = XLSX.SSF.parse_date_code(v); return d ? `${d.y}-${pad(d.m)}-${pad(d.d)}` : null; }
+  const s = String(v).trim();
+  let m = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+  if (m) return `${m[1]}-${pad(m[2])}-${pad(m[3])}`;
+  m = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})/);
+  if (m) return `${m[3].length === 2 ? "20" + m[3] : m[3]}-${pad(m[2])}-${pad(m[1])}`;
+  return null;
+}
+function difDiasFirmado(a, b) { // b - a en días
+  if (!a || !b) return null;
+  const [y1, m1, d1] = a.split("-").map(Number), [y2, m2, d2] = b.split("-").map(Number);
+  return Math.round((Date.UTC(y2, m2 - 1, d2) - Date.UTC(y1, m1 - 1, d1)) / 864e5);
+}
+function normMoneda(v) {
+  const raw = String(v ?? "");
+  const s = normTxt(raw).replace(/\s/g, "");
+  if (/₡/.test(raw) || /^(crc|colon|colones)$/.test(s)) return "CRC";
+  if (/€/.test(raw) || /^(eur|euro|euros)$/.test(s)) return "EUR";
+  if (/^(gtq|q|quetzal|quetzales)$/.test(s)) return "GTQ";
+  if (/^(usd|dolar|dolares|us)$/.test(s) || raw.trim() === "$") return "USD";
+  if (/^(hnl|lempira|lempiras)$/.test(s)) return "HNL";
+  if (/^(nio|cordoba|cordobas)$/.test(s)) return "NIO";
+  if (/^(dop|rd)$/.test(s)) return "DOP";
+  return s ? s.toUpperCase().slice(0, 3) : null;
+}
+const soloDigitos = v => String(v ?? "").replace(/\D/g, "").replace(/^0+/, "");
+const alfanum = v => sinAcentos(v).toUpperCase().replace(/[^A-Z0-9]/g, "");
+const RUIDO = /\b(s ?a|sociedad|anonima|ltda|limitada|srl|s r l|de c v|inc|corp|corporacion|cia|compania|de|del|la|el|y|the|co)\b/g;
+function simNombre(a, b) {
+  const x = normTxt(a).replace(RUIDO, " ").replace(/\s+/g, " ").trim();
+  const y = normTxt(b).replace(RUIDO, " ").replace(/\s+/g, " ").trim();
+  if (!x || !y) return null;
+  if (x === y) return 1;
+  const xs = x.replace(/ /g, ""), ys = y.replace(/ /g, "");
+  if (xs === ys) return 1;
+  if (xs.includes(ys) || ys.includes(xs)) return 0.9;
+  // Tokens que coinciden aunque la lectura tenga 1-2 letras distintas ("GUARCO" ≈ "CUARCO")
+  const A = [...new Set(x.split(" "))], B = [...new Set(y.split(" "))];
+  const parecidos = (a, b) => a === b || (Math.min(a.length, b.length) >= 4 && lev(a, b) <= (Math.max(a.length, b.length) >= 8 ? 2 : 1));
+  const usados = new Set(); let comunes = 0;
+  A.forEach(a => { const j = B.findIndex((b, k) => !usados.has(k) && parecidos(a, b)); if (j > -1) { usados.add(j); comunes++; } });
+  return comunes / (A.length + B.length - comunes);
+}
+function lev(a, b) {
+  if (a === b) return 0;
+  const m = a.length, n = b.length; if (!m || !n) return m || n;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[n];
+}
+function matchNumero(f, valorExcel) {
+  const ex = String(valorExcel ?? "").trim();
+  if (!ex) return null;
+  const cands = [f.numero, f.clave, f.serie && f.numero ? f.serie + f.numero : null].filter(Boolean);
+  const dEx = soloDigitos(ex), aEx = alfanum(ex);
+  for (const c of cands) { const dC = soloDigitos(c), aC = alfanum(c); if ((aC && aC === aEx) || (dC && dC.length >= 3 && dC === dEx)) return "exacto"; }
+  for (const c of cands) { const dC = soloDigitos(c); if (dC.length >= 4 && dEx.length >= 4 && (dC.endsWith(dEx) || dEx.endsWith(dC) || dC.includes(dEx))) return "parcial"; }
+  for (const c of f.alternos || []) { const dC = soloDigitos(c), aC = alfanum(c); if ((aC && aC === aEx) || (dC.length >= 4 && dC === dEx)) return "alterno"; }
+  return null;
+}
+const ALIAS_PAIS = { "usa": "estados unidos", "eeuu": "estados unidos", "ee uu": "estados unidos", "united states": "estados unidos", "us": "estados unidos",
+  "rd": "republica dominicana", "dominicana": "republica dominicana", "dominican republic": "republica dominicana", "cr": "costa rica", "gt": "guatemala",
+  "sv": "el salvador", "salvador": "el salvador", "hn": "honduras", "ni": "nicaragua", "pa": "panama", "mx": "mexico", "spain": "espana" };
+const normPais = s => { const n = normTxt(s); return ALIAS_PAIS[n] || n; };
+const u8ToB64 = u8 => { let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+
+/* =====================================================================
+   ESTADO Y POLÍTICA
+   ===================================================================== */
+const S = {
+  excel: { nombre: "", wb: null, hoja: "", raw: [], headerIdx: 0, headers: [], map: {} },
+  informeId: "", cab: null, lineas: [], paisEmpresa: "", monedaLocal: "",
+  archivos: [], facturas: [], resultados: null, procesando: false,
+  politica: clonar(C.POLITICA_DEFECTO), politicaMeta: null, esAdmin: false, regimen: "auto"
+};
+const P = () => S.politica;
+const G = () => S.politica.general;
+function tc(m) { const r = (P().tipos_cambio || []).find(x => x.moneda === m); return r && +r.por_usd > 0 ? +r.por_usd : null; }
+function convertir(v, de, a) { if (v === null || v === undefined || !de || !a) return null; if (de === a) return v; const x = tc(de), y = tc(a); return x && y ? v / x * y : null; }
+function infoPais(nombre) { const n = normPais(nombre); return n ? (P().paises || []).find(p => normPais(p.pais) === n) || null : null; }
+function regionDe(lista, pais) { const n = normPais(pais); return (lista || []).find(r => (r.paises || []).some(p => normPais(p) === n)) || null; }
+function completarPolitica(p) { // asegura que una política guardada tenga todas las claves nuevas
+  const d = clonar(C.POLITICA_DEFECTO);
+  return { ...d, ...p, general: { ...d.general, ...(p.general || {}) }, nacional: { ...d.nacional, ...(p.nacional || {}) } };
+}
+
+const CAMPOS_EXCEL = [
+  ["informe", "No. informe", true], ["numero", "ID factura", true], ["monto", "Importe de gastos", true],
+  ["monto_local", "Importe moneda local", false], ["impuesto", "Importe de impuesto", false], ["codigo_impuesto", "Código de impuesto", false],
+  ["proveedor", "Proveedor", false], ["empleado", "Empleado", false], ["texto", "Texto del informe", false],
+  ["empresa", "Empresa (texto)", false], ["empresa_cod", "Empresa (código)", false], ["pais", "País/Región", false],
+  ["estado", "Estado", false], ["fecha_cont", "Fecha de contabilización", false], ["aprobador", "Aprobador", false],
+  ["id_gasto", "ID de gastos", true], ["fecha_gasto", "Fecha de gasto", true], ["finalidad", "Finalidad", false]
+];
+
+/* =====================================================================
+   SUPABASE Y AUTENTICACIÓN
+   ===================================================================== */
+let sb = null, sesionUid = null, sesionCargada = null;
+const configValida = () => C.SUPABASE_URL && !C.SUPABASE_URL.includes("TU-PROYECTO") && C.SUPABASE_ANON_KEY && !C.SUPABASE_ANON_KEY.includes("TU-ANON");
+
+async function iniciar() {
+  if (!configValida()) {
+    $("#vLogin").classList.remove("oculto");
+    $("#loginMsg").innerHTML = `<div class="aviso error">Falta configurar SUPABASE_URL y SUPABASE_ANON_KEY en el bloque CONFIG al inicio del archivo.</div>`;
+    $("#fLogin").classList.add("oculto");
+    return;
+  }
+  sb = window.supabase.createClient(C.SUPABASE_URL, C.SUPABASE_ANON_KEY);
+  sb.auth.onAuthStateChange((evt, session) => {
+    if (evt === "PASSWORD_RECOVERY") { setTimeout(cambiarClave, 0); return; }
+    if (evt === "SIGNED_IN" || evt === "INITIAL_SESSION" || evt === "SIGNED_OUT") setTimeout(() => mostrarSesion(session), 0);
+  });
+}
+async function mostrarSesion(session) {
+  const ok = !!session;
+  $("#vLogin").classList.toggle("oculto", ok);
+  $("#vApp").classList.toggle("oculto", !ok);
+  if (!ok) { sesionCargada = null; return; }
+  const nombre = session.user.user_metadata?.nombre;
+  $("#uEmail").textContent = nombre ? `${nombre} · ${session.user.email}` : session.user.email;
+  sesionUid = session.user.id;
+  if (sesionCargada === sesionUid) return;
+  sesionCargada = sesionUid;
+  await cargarPolitica();
+  $("#navUsuarios").classList.toggle("oculto", !S.esAdmin);
+}
+async function cambiarClave() {
+  const nueva = prompt("Escribe tu nueva contraseña (mínimo 8 caracteres):");
+  if (!nueva || nueva.length < 8) return toast("Contraseña no cambiada.");
+  const { error } = await sb.auth.updateUser({ password: nueva });
+  toast(error ? "Error: " + error.message : "Contraseña actualizada.");
+}
+$("#fLogin").addEventListener("submit", async e => {
+  e.preventDefault(); $("#loginMsg").innerHTML = "";
+  const { error } = await sb.auth.signInWithPassword({ email: $("#lEmail").value.trim(), password: $("#lPass").value });
+  if (error) $("#loginMsg").innerHTML = `<div class="aviso error">${esc(error.message === "Invalid login credentials" ? "Correo o contraseña incorrectos." : error.message)}</div>`;
+});
+$("#lOlvido").addEventListener("click", async e => {
+  e.preventDefault();
+  const email = $("#lEmail").value.trim();
+  if (!email) return toast("Escribe tu correo primero.");
+  const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: location.href.split("#")[0] });
+  toast(error ? "Error: " + error.message : "Te enviamos un correo para restablecer la contraseña.");
+});
+$("#bSalir").addEventListener("click", () => sb.auth.signOut());
+$("#bMiClave").addEventListener("click", cambiarClave);
+
+$$("header nav button").forEach(b => b.addEventListener("click", () => {
+  $$("header nav button").forEach(x => x.classList.toggle("activo", x === b));
+  ["nueva", "historial", "politicas", "usuarios"].forEach(t => $("#t" + t[0].toUpperCase() + t.slice(1)).classList.toggle("oculto", b.dataset.tab !== t));
+  if (b.dataset.tab === "historial") cargarHistorial();
+  if (b.dataset.tab === "politicas") { renderPolitica(); cargarHistorialPolitica(); }
+  if (b.dataset.tab === "usuarios") cargarUsuarios();
+}));
+
+/* =====================================================================
+   PASO 1 — EXCEL E INFORME
+   ===================================================================== */
+function prepararZona(zona, input, onFiles) {
+  zona.addEventListener("click", () => input.click());
+  zona.addEventListener("dragover", e => { e.preventDefault(); zona.classList.add("sobre"); });
+  zona.addEventListener("dragleave", () => zona.classList.remove("sobre"));
+  zona.addEventListener("drop", e => { e.preventDefault(); zona.classList.remove("sobre"); onFiles([...e.dataTransfer.files]); });
+  input.addEventListener("change", () => { onFiles([...input.files]); input.value = ""; });
+}
+prepararZona($("#zExcel"), $("#fExcel"), files => files[0] && cargarExcel(files[0]));
+
+async function cargarExcel(file) {
+  try {
+    $("#zExcelNom").textContent = "Leyendo " + file.name + "…";
+    const wb = XLSX.read(await file.arrayBuffer(), { type: "array", cellDates: true });
+    S.excel.nombre = file.name; S.excel.wb = wb;
+    $("#zExcelNom").textContent = file.name;
+    $("#sHoja").innerHTML = wb.SheetNames.map(n => `<option>${esc(n)}</option>`).join("");
+    const mejor = wb.SheetNames.map(n => [n, (wb.Sheets[n]["!ref"] ? XLSX.utils.decode_range(wb.Sheets[n]["!ref"]).e.r : 0)]).sort((a, b) => b[1] - a[1])[0][0];
+    $("#sHoja").value = mejor;
+    seleccionarHoja(mejor, true);
+    $("#excelCfg").classList.remove("oculto");
+    $("#iInforme").focus();
+  } catch (err) { console.error(err); toast("No se pudo leer el Excel: " + err.message, 6000); }
+}
+$("#sHoja").addEventListener("change", e => seleccionarHoja(e.target.value, true));
+$("#iHeader").addEventListener("change", e => { S.excel.headerIdx = Math.max(0, (+e.target.value || 1) - 1); armarEncabezados(true); });
+
+function seleccionarHoja(nombre, autodetectar) {
+  S.excel.hoja = nombre;
+  S.excel.raw = XLSX.utils.sheet_to_json(S.excel.wb.Sheets[nombre], { header: 1, raw: true, defval: null, blankrows: false });
+  if (autodetectar) S.excel.headerIdx = detectarEncabezado(S.excel.raw);
+  $("#iHeader").value = S.excel.headerIdx + 1;
+  armarEncabezados(true);
+}
+function detectarEncabezado(raw) {
+  const todos = Object.values(C.ALIAS_COLUMNAS).flat();
+  let mejor = 0, idx = 0;
+  raw.slice(0, 30).forEach((fila, i) => {
+    const p = (fila || []).reduce((s, c) => { const h = normTxt(c); return s + (h && todos.some(a => h === a || h.includes(a)) ? 1 : 0); }, 0);
+    if (p > mejor) { mejor = p; idx = i; }
+  });
+  return idx;
+}
+function armarEncabezados(automap) {
+  const fila = S.excel.raw[S.excel.headerIdx] || [];
+  S.excel.headers = fila.map((h, i) => (h === null || h === "" ? `Columna ${XLSX.utils.encode_col(i)}` : String(h).trim()));
+  if (automap) S.excel.map = autoMapear(S.excel.headers);
+  dibujarMapa();
+  if (CAMPOS_EXCEL.some(([k, , req]) => req && S.excel.map[k] === undefined)) $("#detMapa").open = true;
+  armarListaInformes();
+  if (S.informeId) seleccionarInforme(S.informeId); else actualizarBotones();
+}
+function autoMapear(headers) {
+  const guardado = lsGet("revisor_mapeo_v2", null);
+  const map = {}, usadas = new Set(), norm = headers.map(normTxt);
+  if (guardado) for (const [campo, nombre] of Object.entries(guardado)) {
+    const i = norm.indexOf(normTxt(nombre)); if (i > -1 && !usadas.has(i)) { map[campo] = i; usadas.add(i); }
+  }
+  for (const modo of ["exacto", "parcial"]) for (const [campo] of CAMPOS_EXCEL) {
+    if (map[campo] !== undefined) continue;
+    let i = -1;
+    for (const a of C.ALIAS_COLUMNAS[campo] || []) { i = norm.findIndex((h, j) => !usadas.has(j) && (modo === "exacto" ? h === a : h.includes(a))); if (i > -1) break; }
+    if (i > -1) { map[campo] = i; usadas.add(i); }
+  }
+  return map;
+}
+function dibujarMapa() {
+  const opts = ['<option value="">— no usar —</option>'].concat(S.excel.headers.map((h, i) => `<option value="${i}">${esc(h)}</option>`)).join("");
+  $("#mapa").innerHTML = CAMPOS_EXCEL.map(([k, lbl, req]) => `<div class="campo"><label>${lbl}${req ? ' <span style="color:var(--primario)">*</span>' : ""}</label><select data-campo="${k}">${opts}</select></div>`).join("");
+  $$("#mapa select").forEach(s => {
+    const v = S.excel.map[s.dataset.campo]; s.value = v === undefined ? "" : v;
+    s.addEventListener("change", () => {
+      if (s.value === "") delete S.excel.map[s.dataset.campo]; else S.excel.map[s.dataset.campo] = +s.value;
+      lsSet("revisor_mapeo_v2", Object.fromEntries(Object.entries(S.excel.map).map(([k, i]) => [k, S.excel.headers[i]])));
+      armarListaInformes(); if (S.informeId) seleccionarInforme(S.informeId); else actualizarBotones();
+    });
+  });
+}
+function filasExcelTodas() {
+  const m = S.excel.map;
+  return S.excel.raw.slice(S.excel.headerIdx + 1).map((r, i) => {
+    if (!r) return null;
+    const g = k => (m[k] === undefined ? null : r[m[k]]);
+    const t = k => (g(k) === null ? "" : String(g(k)).trim());
+    return {
+      fila: S.excel.headerIdx + 2 + i, informe: t("informe"), numero: t("numero"), proveedor: t("proveedor"),
+      monto: parseNum(g("monto")), monto_local: parseNum(g("monto_local")), impuesto: parseNum(g("impuesto")) || 0, codigo_impuesto: t("codigo_impuesto"),
+      empleado: t("empleado"), texto: t("texto"), empresa: t("empresa"), empresa_cod: t("empresa_cod"), pais: t("pais"),
+      estado: t("estado"), fecha_cont: parseFecha(g("fecha_cont")), aprobador: t("aprobador"),
+      id_gasto: t("id_gasto"), fecha_gasto: parseFecha(g("fecha_gasto")), finalidad: t("finalidad") === "#" ? "" : t("finalidad")
+    };
+  }).filter(r => r && (r.informe || r.numero));
+}
+function armarListaInformes() {
+  if (S.excel.map.informe === undefined) { $("#dlInformes").innerHTML = ""; $("#informeInfo").textContent = "Mapea la columna del número de informe."; return; }
+  const ids = new Map();
+  filasExcelTodas().forEach(r => { if (r.informe && !ids.has(r.informe)) ids.set(r.informe, r); });
+  $("#dlInformes").innerHTML = [...ids.values()].slice(-800).reverse().map(r => `<option value="${esc(r.informe)}">${esc(r.empleado)} · ${esc(r.texto)}</option>`).join("");
+  $("#excelInfo").textContent = `${ids.size} informes en el archivo`;
+  if (!S.informeId) $("#informeInfo").textContent = `${ids.size} informes en el archivo. Escribe o elige el número a revisar.`;
+}
+$("#iInforme").addEventListener("change", e => seleccionarInforme(e.target.value.trim()));
+$("#iInforme").addEventListener("keydown", e => { if (e.key === "Enter") seleccionarInforme(e.target.value.trim()); });
+
+function seleccionarInforme(id) {
+  S.informeId = id; S.resultados = null; $("#resultados").classList.add("oculto");
+  const filas = filasExcelTodas().filter(r => normTxt(r.informe) === normTxt(id));
+  if (!id || !filas.length) {
+    S.cab = null; S.lineas = [];
+    $("#cabInforme").innerHTML = id ? `<div class="aviso error" style="margin:10px 0 0">El informe <b>${esc(id)}</b> no está en este Excel.</div>` : "";
+    $("#prevWrap").classList.add("oculto"); actualizarBotones(); return;
+  }
+  const f0 = filas[0];
+  S.cab = { informe: id, empleado: f0.empleado, texto: f0.texto, empresa: f0.empresa, empresa_cod: f0.empresa_cod, pais: f0.pais, estado: f0.estado, fecha_cont: f0.fecha_cont, aprobador: f0.aprobador };
+  S.paisEmpresa = detectarPaisEmpresa(S.cab);
+  S.monedaLocal = infoPais(S.paisEmpresa)?.moneda || "";
+  S.lineas = agruparLineas(filas);
+  $("#informeInfo").textContent = `${filas.length} filas en SAP → ${S.lineas.length} líneas de gasto`;
+  dibujarCabecera(); dibujarPrevia(); actualizarBotones();
+}
+function detectarPaisEmpresa(cab) {
+  const lista = P().paises || [];
+  const txt = normTxt(cab.empresa);
+  let p = lista.find(x => txt.includes(normTxt(x.pais)));
+  if (p) return p.pais;
+  const cod = String(cab.empresa_cod || "").toUpperCase();
+  p = lista.find(x => (x.codigos || []).some(c => c && cod.startsWith(String(c).toUpperCase())));
+  if (p) return p.pais;
+  return infoPais(cab.pais)?.pais || "";
+}
+/** Orden de SAP: por "ID de gastos" (numérico cuando se puede) */
+const numGasto = v => { const n = parseFloat(String(v ?? "").replace(",", ".")); return isNaN(n) ? Infinity : n; };
+const ordenGasto = (a, b) => numGasto(a.id_gasto) - numGasto(b.id_gasto) || String(a.id_gasto).localeCompare(String(b.id_gasto)) || (a.filas[0] ?? 0) - (b.filas[0] ?? 0);
+const idsLinea = l => l ? [l.solo_propina ? null : l.id_gasto, ...(l.ids_propina || []).map(x => x + " (P)")].filter(x => x !== null && x !== "").join(", ") : "";
+/** Agrupa las filas "-P" (propina) con su factura base */
+function regexPropina() {
+  const lista = (G().sufijos_propina || ["P"]).map(x => String(x).trim()).filter(Boolean);
+  if (lista.includes("*")) return /^(.*?)[\s_-]+([A-Za-z]{1,6})$/;   // "*" = cualquier sufijo de letras
+  const suf = lista.map(x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return new RegExp(`^(.*?)[\\s_-]+(${suf.join("|") || "P"})$`, "i");
+}
+function agruparLineas(filas) {
+  const re = regexPropina();
+  const lineas = [], porNum = new Map();
+  const nueva = (r, base) => ({ id: uid(), filas: [r.fila], filas_propina: [], numero: base, proveedor: r.proveedor, monto: r.monto, monto_local: r.monto_local ?? r.monto,
+    impuesto: r.impuesto, codigo_impuesto: r.codigo_impuesto, propina: 0, propina_local: 0, propina_imp: 0, solo_propina: false,
+    id_gasto: r.id_gasto, ids_propina: [], propinas: [], fecha_gasto: r.fecha_gasto, finalidad: r.finalidad });
+  const bases = new Set(filas.filter(r => !re.test(r.numero)).map(r => alfanum(r.numero)));
+  const esPropina = r => re.test(r.numero) && bases.has(alfanum(r.numero.match(re)[1].trim()));
+  filas.filter(r => !esPropina(r)).forEach(r => {
+    const l = nueva(r, r.numero); lineas.push(l);
+    const k = alfanum(r.numero); if (k && !porNum.has(k)) porNum.set(k, l);
+  });
+  filas.filter(esPropina).forEach(r => {
+    const base = r.numero.match(re)[1].trim();
+    let l = porNum.get(alfanum(base));
+    if (!l) { l = nueva(r, base); l.monto = 0; l.monto_local = 0; l.impuesto = 0; l.filas = []; l.solo_propina = true; l.id_gasto = r.id_gasto; lineas.push(l); porNum.set(alfanum(base), l); }
+    l.propinas.push({ id_gasto: r.id_gasto, fila: r.fila, numero: r.numero, monto: r.monto, monto_local: r.monto_local ?? r.monto, impuesto: r.impuesto, codigo_impuesto: r.codigo_impuesto, fecha_gasto: r.fecha_gasto });
+    l.filas_propina.push(r.fila); l.ids_propina.push(r.id_gasto + (r.numero.match(re)[2].toUpperCase() !== "P" ? ` (-${r.numero.match(re)[2].toUpperCase()})` : ""));
+    l.propina += r.monto || 0; l.propina_local += (r.monto_local ?? r.monto) || 0; l.propina_imp += r.impuesto || 0;
+  });
+  return lineas.sort(ordenGasto);
+}
+function dibujarCabecera() {
+  const c = S.cab;
+  const opPais = ['<option value="">—</option>'].concat((P().paises || []).map(p => `<option ${p.pais === S.paisEmpresa ? "selected" : ""}>${esc(p.pais)}</option>`)).join("");
+  const opMon = ['<option value="">—</option>'].concat((P().tipos_cambio || []).map(t => `<option ${t.moneda === S.monedaLocal ? "selected" : ""}>${esc(t.moneda)}</option>`)).join("");
+  const totLoc = S.lineas.reduce((s, l) => s + (l.monto_local || 0) + (l.propina_local || 0), 0);
+  $("#cabInforme").innerHTML = `<div class="cab">
+    <div><b>Informe</b>${esc(c.informe)}</div><div><b>Colaborador</b>${esc(c.empleado)}</div>
+    <div style="grid-column:span 2"><b>Descripción</b>${esc(c.texto)}</div>
+    <div><b>Empresa</b>${esc(c.empresa)} <span class="muted">(${esc(c.empresa_cod)})</span></div>
+    <div><b>Estado SAP</b>${esc(c.estado)}</div><div><b>Contabilización</b>${esc(c.fecha_cont || "—")}</div>
+    <div><b>Aprobador</b>${esc(c.aprobador)}</div><div><b>Total en moneda local</b>${esc(mm(S.monedaLocal, totLoc))}</div>
+    <div><b>País de la empresa</b><select id="sPaisEmp">${opPais}</select></div>
+    <div><b>Moneda local</b><select id="sMonLoc">${opMon}</select></div>
+  </div>`;
+  $("#sPaisEmp").addEventListener("change", e => { S.paisEmpresa = e.target.value; S.monedaLocal = infoPais(S.paisEmpresa)?.moneda || S.monedaLocal; S.resultados = null; dibujarCabecera(); actualizarBotones(); });
+  $("#sMonLoc").addEventListener("change", e => { S.monedaLocal = e.target.value; S.resultados = null; dibujarCabecera(); actualizarBotones(); });
+}
+function dibujarPrevia() {
+  $("#prevWrap").classList.remove("oculto");
+  const ml = S.monedaLocal;
+  $("#tPrev").innerHTML = `<thead><tr><th>ID gasto</th><th>Fecha gasto</th><th>ID factura</th><th>Proveedor</th><th class="num">Importe</th><th class="num">Importe ${esc(ml || "local")}</th><th class="num">Impuesto</th><th>Cód. imp.</th><th class="num">Propina</th></tr></thead><tbody>` +
+    S.lineas.map(l => `<tr><td><b>${esc(l.solo_propina ? "" : l.id_gasto)}</b>${l.ids_propina.length ? ` <span class="muted mini">+ P ${esc(l.ids_propina.join(", "))}</span>` : ""}</td><td class="mini">${esc(l.fecha_gasto || "—")}</td>
+      <td>${esc(l.numero)}${l.solo_propina ? ' <span class="chip warn">solo propina</span>' : ""}</td><td>${esc(l.proveedor)}</td>
+      <td class="num">${money(l.monto)}</td><td class="num">${money(l.monto_local)}${l.monto_local !== l.monto ? ' <span class="chip proc" title="El importe y el importe local difieren: hubo conversión de moneda">TC</span>' : ""}</td>
+      <td class="num">${money(l.impuesto)}</td><td>${esc(l.codigo_impuesto)}</td><td class="num">${l.propina ? money(l.propina) : ""}</td></tr>`).join("") + "</tbody>";
+}
+
+/* =====================================================================
+   PASO 2 — FACTURAS (EXTRACCIÓN CON IA)
+   ===================================================================== */
+prepararZona($("#zFact"), $("#fFact"), agregarArchivos);
+
+async function agregarArchivos(files) {
+  if (C.MODO_LECTURA === "copilot") return agregarArchivosCopilot(files);
+  const validos = files.filter(f => /pdf|jpe?g|png|webp/i.test(f.type) || /\.(pdf|jpe?g|png|webp)$/i.test(f.name));
+  if (validos.length < files.length) toast("Algunos archivos se omitieron (solo PDF, JPG, PNG o WEBP). Las fotos HEIC de iPhone deben convertirse a JPG.", 6000);
+  for (const file of validos) {
+    if (file.size > C.MAX_MB_ARCHIVO * 1048576) { toast(`${file.name} supera ${C.MAX_MB_ARCHIVO} MB`); continue; }
+    if (S.archivos.some(a => a.origen === file.name && a.tamOrigen === file.size)) continue;
+    const esPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+    if (esPdf && C.DIVIDIR_PDF_POR_PAGINA && window.PDFLib) {
+      try {
+        const src = await PDFLib.PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
+        const n = src.getPageCount();
+        for (let i = 0; i < n; i++) {
+          const doc = await PDFLib.PDFDocument.create();
+          const [pg] = await doc.copyPages(src, [i]); doc.addPage(pg);
+          const bytes = await doc.save();
+          S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, nombre: n > 1 ? `${file.name} · pág. ${i + 1} de ${n}` : file.name, tipo: "application/pdf", bytes, size: bytes.length, estado: "pendiente", error: "", n: 0 });
+        }
+        continue;
+      } catch (err) { console.warn("No se pudo dividir el PDF, se envía completo", err); }
+    }
+    S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, nombre: file.name, tipo: esPdf ? "application/pdf" : file.type, file, size: file.size, estado: "pendiente", error: "", n: 0 });
+  }
+  dibujarArchivos(); actualizarBotones();
+}
+function dibujarArchivos() {
+  if (C.MODO_LECTURA === "copilot") return dibujarArchivosCopilot();
+  const et = a => ({ pendiente: '<span class="chip na">Pendiente</span>', proc: '<span class="chip proc">Leyendo…</span>',
+    ok: `<span class="chip ${a.esperados && a.n !== a.esperados ? "warn" : "ok"}">✓ ${a.n}${a.esperados ? " de " + a.esperados : ""} comprobante${a.n === 1 ? "" : "s"}</span>`, error: '<span class="chip error">Error</span>' }[a.estado]);
+  $("#listaArch").innerHTML = S.archivos.map(a => `<div class="archivo">
+      <span class="n" title="${esc(a.nombre)}">${esc(a.nombre)} <span class="muted mini">(${(a.size / 1024).toFixed(0)} KB)</span></span>
+      ${a.error ? `<span class="err">${esc(a.error)}</span>` : ""}${et(a)}
+      ${a.estado === "error" ? `<button class="btn chico" data-reintentar="${a.id}">Reintentar</button>` : ""}
+      ${a.estado === "ok" ? `<button class="btn chico" data-releer="${a.id}" title="Volver a leer con IA indicando cuántos comprobantes hay">Releer</button>` : ""}
+      <button class="btn chico" data-quitar="${a.id}" ${S.procesando ? "disabled" : ""}>Quitar</button></div>`).join("");
+  $$("[data-quitar]").forEach(b => b.addEventListener("click", () => {
+    const id = b.dataset.quitar; S.archivos = S.archivos.filter(a => a.id !== id); S.facturas = S.facturas.filter(f => f.archivoId !== id);
+    dibujarArchivos(); dibujarFacturas(); actualizarBotones();
+  }));
+  $$("[data-reintentar],[data-releer]").forEach(b => b.addEventListener("click", () => {
+    const a = S.archivos.find(x => x.id === (b.dataset.reintentar || b.dataset.releer));
+    if (b.dataset.releer) {
+      const r = prompt(`¿Cuántos comprobantes distintos ves en "${a.nombre}"? (déjalo vacío si no sabes)\nLa IA los buscará todos, incluidos los cortados o tapados.`, a.esperados || "");
+      if (r === null) return;
+      a.esperados = parseInt(r, 10) || null;
+    }
+    a.estado = "pendiente"; a.error = ""; extraerTodas();
+  }));
+}
+function leerBase64(file) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = rej; r.readAsDataURL(file); }); }
+async function prepararArchivo(a) {
+  if (a.bytes) return { tipo: "application/pdf", datos: u8ToB64(a.bytes) };
+  if (a.tipo === "application/pdf") return { tipo: "application/pdf", datos: await leerBase64(a.file) };
+  const bmp = await createImageBitmap(a.file);
+  const k = Math.min(1, C.MAX_PX_IMAGEN / Math.max(bmp.width, bmp.height));
+  const cv = document.createElement("canvas"); cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
+  const ctx = cv.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height); ctx.drawImage(bmp, 0, 0, cv.width, cv.height);
+  return { tipo: "image/jpeg", datos: cv.toDataURL("image/jpeg", 0.88).split(",")[1] };
+}
+async function extraerArchivo(a) {
+  a.estado = "proc"; a.error = ""; dibujarArchivos();
+  try {
+    const { tipo, datos } = await prepararArchivo(a);
+    let data = null;
+    for (let intento = 0; ; intento++) {
+      const r = await sb.functions.invoke(C.FUNCION_EXTRACCION, { body: { archivo: a.nombre, tipo, datos, esperados: a.esperados || null } });
+      if (!r.error) { data = r.data; break; }
+      let msg = r.error.message, status = r.error.context?.status;
+      try { const j = await r.error.context.json(); msg = j.error || msg; } catch {}
+      if (status === 429 && intento < C.REINTENTOS_LIMITE) {
+        const espera = 20 * (intento + 1);
+        a.error = `Límite por minuto: reintentando en ${espera} s…`; dibujarArchivos();
+        await new Promise(res => setTimeout(res, espera * 1000));
+        a.error = ""; dibujarArchivos(); continue;
+      }
+      if (/failed to send|failed to fetch|networkerror|load failed/i.test(msg)) {
+        S.funcionCaida = true;
+        throw new Error("No se pudo contactar la función: revisa que exista 'extraer-factura', que Verify JWT esté apagado y el secreto ALLOWED_ORIGIN");
+      }
+      throw new Error(msg);
+    }
+    const lista = data?.facturas || [];
+    S.facturas = S.facturas.filter(f => f.archivoId !== a.id);
+    lista.forEach((f, i) => S.facturas.push(normalizarFactura(f, a, i, lista.length)));
+    a.n = lista.length; a.estado = lista.length ? "ok" : "error";
+    if (!lista.length) a.error = "No se encontró ningún comprobante";
+    else if (a.esperados && lista.length !== a.esperados) a.error = `Se encontraron ${lista.length} de ${a.esperados} comprobantes indicados: revisa la página o agrega los faltantes manualmente`;
+    if (data?.truncado) a.error = "Respuesta incompleta: revisa si faltan comprobantes";
+  } catch (err) { console.error(err); a.estado = "error"; a.error = err.message || "Error desconocido"; }
+  dibujarArchivos(); dibujarFacturas();
+}
+function normalizarFactura(f, a, i, total) {
+  const hora = /^\d{1,2}:\d{2}/.test(f.hora || "") ? f.hora.slice(0, 5).padStart(5, "0") : "";
+  const out = {
+    id: uid(), archivoId: a.id, archivo: a.nombre + (total > 1 ? ` #${i + 1}` : ""),
+    numero: f.numero ? String(f.numero).trim() : "", serie: f.serie || "", clave: f.clave_numerica ? String(f.clave_numerica).replace(/\D/g, "") : "",
+    fecha: parseFecha(f.fecha_emision), hora, proveedor: f.proveedor_nombre || "", nit: f.proveedor_identificacion || "", receptor: f.receptor_nombre || "",
+    pais: infoPais(f.pais_emisor)?.pais || f.pais_emisor || "", moneda: normMoneda(f.moneda) || "",
+    categoria: normCategoria(f.categoria), tiempo: normTiempo(f.tiempo_comida), personas: parseInt(f.personas, 10) || null, noches: parseInt(f.noches, 10) || null,
+    impuesto: parseNum(f.impuesto), iva_incluido: esVerdadero(f.iva_incluido), propina: parseNum(f.propina), total: parseNum(f.total),
+    total_pagado: parseNum(f.total_pagado), items: f.resumen_items || "", tipo_documento: f.tipo_documento || "",
+    legible: !(f.legible === false || /^(false|no)$/i.test(String(f.legible))), confianza: parseNum(f.confianza), observaciones: f.observaciones || "",
+    alternos: (Array.isArray(f.numeros_alternos) ? f.numeros_alternos : String(f.numeros_alternos || "").split(/[,;|]/)).map(x => String(x).trim()).filter(Boolean),
+    visibilidad: ["completa", "parcial", "ilegible"].includes(normTxt(f.visibilidad)) ? normTxt(f.visibilidad) : (f.legible === false ? "ilegible" : "completa"),
+    no_visibles: (Array.isArray(f.campos_no_visibles) ? f.campos_no_visibles : String(f.campos_no_visibles || "").split(/[,;|]/)).map(x => String(x).trim()).filter(Boolean),
+    es_fiscal: f.es_fiscal === undefined || f.es_fiscal === null ? true : esVerdadero(f.es_fiscal),
+    regimen: "auto", editada: false
+  };
+  // Costa Rica: el consecutivo oficial (20 dígitos) está dentro de la clave de 50 dígitos (posiciones 22-41).
+  // Si la IA tomó otro número (tiquete interno, orden…), se corrige con el de la clave.
+  if (/^506\d{47}$/.test(out.clave)) {
+    const consecutivo = out.clave.slice(21, 41);
+    if (soloDigitos(out.numero) !== soloDigitos(consecutivo)) {
+      if (out.numero && !out.alternos.includes(out.numero)) out.alternos.unshift(out.numero);
+      out.observaciones = [out.observaciones, `Número tomado de la clave numérica (la lectura indicaba "${out.numero || "—"}")`].filter(Boolean).join(" · ");
+      out.numero = consecutivo;
+    }
+  }
+  // Si la IA leyó el subtotal sin IVA como total: total + IVA + propina = total pagado → corregir
+  if (out.impuesto > 0 && out.total !== null && out.total_pagado) {
+    const conIva = out.total + out.impuesto + (out.propina || 0), sinIva = out.total + (out.propina || 0);
+    if (Math.abs(conIva - out.total_pagado) <= 0.05 && Math.abs(sinIva - out.total_pagado) > 0.05) {
+      out.total = Math.round((out.total + out.impuesto) * 100) / 100;
+      out.observaciones = [out.observaciones, `Total corregido: se sumó el IVA al subtotal leído (total pagado ${money(out.total_pagado)})`].filter(Boolean).join(" · ");
+    }
+  }
+  return out;
+}
+async function extraerTodas() {
+  if (S.procesando) return;
+  const cola = S.archivos.filter(a => a.estado === "pendiente");
+  if (!cola.length) return;
+  S.procesando = true; actualizarBotones(); $("#barra").classList.remove("oculto");
+  let hechos = 0; const total = cola.length;
+  const avanzar = () => { $("#barra i").style.width = `${(hechos / total) * 100}%`; $("#extraerInfo").textContent = `${hechos} de ${total} archivos/páginas`; };
+  avanzar();
+  S.funcionCaida = false;
+  const trabajador = async () => {
+    while (cola.length) {
+      if (S.funcionCaida) { cola.length = 0; break; }   // no insistir con las demás páginas si la función no responde
+      const a = cola.shift(); await extraerArchivo(a); hechos++; avanzar();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(C.PROCESOS_SIMULTANEOS, total) }, trabajador));
+  S.procesando = false; setTimeout(() => $("#barra").classList.add("oculto"), 800);
+  const errores = S.archivos.filter(a => a.estado === "error").length;
+  $("#extraerInfo").textContent = S.funcionCaida
+    ? "Se detuvo la lectura: la función de Supabase no responde. Corrige la configuración y presiona Reintentar."
+    : `Listo: ${S.facturas.length} comprobantes leídos${errores ? ` · ${errores} con error` : ""}`;
+  dibujarArchivos(); actualizarBotones();
+}
+$("#bExtraer").addEventListener("click", extraerTodas);
+
+/* ---------- Modo Copilot Chat (gratis, copiar y pegar) ---------- */
+const PROMPT_COPILOT = [
+  "Eres auditor de cuentas por pagar. Te voy a enviar imágenes de páginas escaneadas con facturas y tiquetes de gastos de viaje (Centroamérica y el Caribe). Cada página puede traer VARIOS comprobantes pegados uno al lado del otro.",
+  "",
+  "Para CADA imagen que te envíe, responde ÚNICAMENTE con un bloque de código ```json que contenga una lista, con un objeto por comprobante y exactamente estas claves:",
+  "numero, serie, fecha_emision (AAAA-MM-DD), hora (HH:MM 24 h), proveedor_nombre, proveedor_identificacion, receptor_nombre, pais_emisor, moneda (GTQ, CRC, USD, HNL, NIO, DOP, MXN, EUR), categoria (alimentacion | hospedaje | transporte | combustible | parqueo | otros), tiempo_comida (desayuno | almuerzo | cena | null), personas, noches, impuesto, iva_incluido (true/false), propina, total, tipo_documento, resumen_items, legible (true/false), confianza (0 a 1), observaciones",
+  "",
+  "Reglas:",
+  "- No inventes datos. Si algo no se ve, usa null y explícalo en observaciones.",
+  "- Montos como números sin símbolos ni separadores de miles (ej. 1234.56). Q = GTQ, ₡ = CRC, L = HNL, C$ = NIO, RD$ = DOP.",
+  "- numero: en FEL Guatemala es el \"Número\" del DTE (no la serie ni la autorización); en Costa Rica el consecutivo; en recibos manuales el número impreso.",
+  "- total = total de la factura SIN propina. La propina (Propina, Servicio, Tips, Other) va en \"propina\". Ej.: \"Total 917.95 / Servicio 92.05 / Total 1,010.00\" → total 917.95 y propina 92.05.",
+  "- Un voucher de tarjeta impreso junto a la factura del mismo consumo NO es otro comprobante.",
+  "- impuesto = IVA desglosado (no IDP ni otros impuestos). Si dice \"IVA incluido\" sin desglosar: impuesto null e iva_incluido true.",
+  "- personas: si aparece \"Personas\", \"Clientes\" o \"Comensales\". noches: solo para hoteles.",
+  "- La fecha de emisión (día/mes/año en la región) prevalece sobre la de certificación.",
+  "- Baja la confianza si algún monto o fecha es manuscrito, borroso o está cortado.",
+  "",
+  "No escribas explicaciones fuera del bloque JSON. Responde \"listo\" a este mensaje y espera la primera imagen."
+].join("\n");
+
+const esVerdadero = v => v === true || /^(true|si|sí|yes|1)$/i.test(String(v ?? "").trim());
+function normCategoria(v) {
+  const c = normTxt(v);
+  if (/alim|comid|restau|cafe/.test(c)) return "alimentacion";
+  if (/hosped|hotel|aloja/.test(c)) return "hospedaje";
+  if (/transp|taxi|uber|bus|vuelo|aere/.test(c)) return "transporte";
+  if (/combust|gasol|diesel/.test(c)) return "combustible";
+  if (/parq/.test(c)) return "parqueo";
+  return "otros";
+}
+function normTiempo(v) { const t = normTxt(v); return /desay/.test(t) ? "desayuno" : /almuer/.test(t) ? "almuerzo" : /cena/.test(t) ? "cena" : ""; }
+
+/** Interpreta la respuesta pegada de Copilot: JSON (lista u objeto) o, como respaldo, una tabla */
+function parsearRespuesta(txt) {
+  const t = String(txt || "").replace(/[“”]/g, '"').replace(/```(json)?/gi, " ").replace(/\bNone\b/g, "null").trim();
+  const limpiar = s => s.replace(/,\s*([\]}])/g, "$1");
+  const i = t.indexOf("["), j = t.lastIndexOf("]");
+  if (i > -1 && j > i) { try { const a = JSON.parse(limpiar(t.slice(i, j + 1))); if (Array.isArray(a) && a.every(x => x && typeof x === "object")) return a; } catch {} }
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  if (a > -1 && b > a) {
+    try { const o = JSON.parse(limpiar(t.slice(a, b + 1))); return Array.isArray(o.comprobantes) ? o.comprobantes : [o]; }
+    catch { // varios objetos sueltos uno tras otro
+      const objs = t.slice(a, b + 1).split(/}\s*,?\s*{/).map((s, k, arr) => (k > 0 ? "{" : "") + s + (k < arr.length - 1 ? "}" : ""));
+      try { return objs.map(s => JSON.parse(limpiar(s))); } catch {}
+    }
+  }
+  return parsearTabla(t);
+}
+function parsearTabla(t) {
+  const lineas = t.split(/\r?\n/).map(l => l.trim()).filter(l => l && !/^[|\s:-]+$/.test(l));
+  const sep = lineas.some(l => l.includes("\t")) ? "\t" : "|";
+  const celdas = l => l.split(sep).map(c => c.trim()).filter((c, k, arr) => !(sep === "|" && (k === 0 || k === arr.length - 1) && c === ""));
+  const hIdx = lineas.findIndex(l => /total/i.test(l) && /(numero|número|proveedor)/i.test(l));
+  if (hIdx < 0) return [];
+  const claves = celdas(lineas[hIdx]).map(h => normTxt(h).replace(/ /g, "_"));
+  return lineas.slice(hIdx + 1).map(l => { const v = celdas(l), o = {}; claves.forEach((k, n) => { o[k] = v[n] === "" || /^null$/i.test(v[n] || "") ? null : v[n]; }); return o; })
+    .filter(o => o.total !== undefined || o.numero !== undefined);
+}
+async function copiarTexto(txt) {
+  try { await navigator.clipboard.writeText(txt); return true; }
+  catch { const ta = document.createElement("textarea"); ta.value = txt; document.body.appendChild(ta); ta.select(); const ok = document.execCommand("copy"); ta.remove(); return ok; }
+}
+const canvasABlob = (cv, tipo, q) => new Promise(res => cv.toBlob(res, tipo, q));
+async function renderizarImagen(fuente, ancho, alto) {
+  const k = Math.min(1, C.MAX_PX_IMAGEN / Math.max(ancho, alto));
+  const cv = document.createElement("canvas"); cv.width = Math.round(ancho * k); cv.height = Math.round(alto * k);
+  const ctx = cv.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
+  await fuente(ctx, k, cv);
+  return canvasABlob(cv, "image/jpeg", 0.88);
+}
+async function agregarArchivosCopilot(files) {
+  const validos = files.filter(f => /pdf|jpe?g|png|webp/i.test(f.type) || /\.(pdf|jpe?g|png|webp)$/i.test(f.name));
+  if (validos.length < files.length) toast("Algunos archivos se omitieron (solo PDF, JPG, PNG o WEBP).", 5000);
+  $("#extraerInfo").textContent = "Preparando imágenes…";
+  for (const file of validos) {
+    if (S.archivos.some(a => a.origen === file.name && a.tamOrigen === file.size)) continue;
+    try {
+      if (file.type === "application/pdf" || /\.pdf$/i.test(file.name)) {
+        if (!window.pdfjsLib) throw new Error("No se cargó el lector de PDF");
+        pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+        const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+        for (let p = 1; p <= pdf.numPages; p++) {
+          const page = await pdf.getPage(p), v1 = page.getViewport({ scale: 1 });
+          const escala = Math.min(4, C.MAX_PX_IMAGEN / Math.max(v1.width, v1.height));
+          const vp = page.getViewport({ scale: escala });
+          const blob = await renderizarImagen(async (ctx) => { await page.render({ canvasContext: ctx, viewport: vp }).promise; }, vp.width, vp.height);
+          S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, nombre: pdf.numPages > 1 ? `${file.name} · pág. ${p} de ${pdf.numPages}` : file.name,
+            blob, url: URL.createObjectURL(blob), size: blob.size, estado: "pendiente", error: "", n: 0, borrador: "" });
+          $("#extraerInfo").textContent = `Preparando ${file.name}: página ${p} de ${pdf.numPages}…`;
+        }
+      } else {
+        const bmp = await createImageBitmap(file);
+        const blob = await renderizarImagen(async (ctx, k) => ctx.drawImage(bmp, 0, 0, bmp.width * k, bmp.height * k), bmp.width, bmp.height);
+        S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, nombre: file.name, blob, url: URL.createObjectURL(blob), size: blob.size, estado: "pendiente", error: "", n: 0, borrador: "" });
+      }
+    } catch (err) { console.error(err); toast(`No se pudo preparar ${file.name}: ${err.message}`, 6000); }
+  }
+  $("#extraerInfo").textContent = "";
+  dibujarArchivos(); actualizarBotones();
+}
+function dibujarArchivosCopilot() {
+  const lista = $("#listaArch"); lista.classList.add("copilot");
+  const estado = a => a.estado === "ok" ? `<span class="chip ok">✓ ${a.n} comprobante${a.n === 1 ? "" : "s"}</span>` : a.error ? `<span class="chip error">${esc(a.error)}</span>` : '<span class="chip na">Pendiente</span>';
+  const tarjeta = a => `<div class="pagina">
+      ${a.url ? `<img class="thumb" src="${a.url}" alt="Vista previa" data-abrir="${a.id}" title="Ver en grande">` : ""}
+      <div class="pag-body">
+        <div class="fila" style="justify-content:space-between;align-items:center;gap:6px"><b class="mini">${esc(a.nombre)}</b>${estado(a)}</div>
+        <div class="fila" style="margin:6px 0;gap:6px">
+          ${a.url ? `<button class="btn chico" data-copiarimg="${a.id}">Copiar imagen</button><a class="btn chico" href="${a.url}" download="${esc(a.nombre.replace(/[^\w.-]+/g, "_"))}.jpg">Descargar JPG</a>` : ""}
+          ${a.id !== "_libre" ? `<button class="btn chico" data-quitar="${a.id}">Quitar</button>` : ""}</div>
+        <textarea data-pegar="${a.id}" rows="${a.estado === "ok" ? 2 : 3}" placeholder="Pega aquí la respuesta de Copilot para esta página">${esc(a.borrador)}</textarea>
+        <button class="btn chico ${a.estado === "ok" ? "" : "primario"}" data-agregar="${a.id}" style="margin-top:6px">${a.estado === "ok" ? "Reemplazar comprobantes" : "Agregar comprobantes"}</button>
+      </div></div>`;
+  const libre = { id: "_libre", nombre: "Respuesta de Copilot sin imagen (si subiste el archivo directo a Copilot)", estado: "pendiente", error: "", borrador: S.borradorLibre || "" };
+  lista.innerHTML = S.archivos.map(tarjeta).join("") + tarjeta(libre);
+  $$("[data-pegar]", lista).forEach(ta => ta.addEventListener("input", () => {
+    if (ta.dataset.pegar === "_libre") S.borradorLibre = ta.value; else S.archivos.find(a => a.id === ta.dataset.pegar).borrador = ta.value;
+  }));
+  $$("[data-abrir]", lista).forEach(im => im.addEventListener("click", () => window.open(S.archivos.find(a => a.id === im.dataset.abrir).url, "_blank")));
+  $$("[data-copiarimg]", lista).forEach(b => b.addEventListener("click", async () => {
+    const a = S.archivos.find(x => x.id === b.dataset.copiarimg);
+    try {
+      const bmp = await createImageBitmap(a.blob);
+      const cv = document.createElement("canvas"); cv.width = bmp.width; cv.height = bmp.height; cv.getContext("2d").drawImage(bmp, 0, 0);
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": await canvasABlob(cv, "image/png") })]);
+      toast("Imagen copiada. Pégala en Copilot con Ctrl+V y envía.");
+    } catch (err) { console.warn(err); toast("Tu navegador no permite copiar imágenes; usa Descargar JPG y arrástralo a Copilot.", 6000); }
+  }));
+  $$("[data-quitar]", lista).forEach(b => b.addEventListener("click", () => {
+    const id = b.dataset.quitar; S.archivos = S.archivos.filter(a => a.id !== id); S.facturas = S.facturas.filter(f => f.archivoId !== id);
+    dibujarArchivos(); dibujarFacturas(); actualizarBotones();
+  }));
+  $$("[data-agregar]", lista).forEach(b => b.addEventListener("click", () => {
+    const id = b.dataset.agregar;
+    const txt = $(`[data-pegar="${id}"]`, lista).value;
+    const comps = parsearRespuesta(txt);
+    if (!comps.length) return toast("No encontré comprobantes en el texto. Copia completo el bloque de código que respondió Copilot.", 6000);
+    let a = S.archivos.find(x => x.id === id);
+    if (id === "_libre") {
+      a = { id: uid(), origen: "Copilot", nombre: `Pegado desde Copilot #${S.archivos.filter(x => !x.url).length + 1}`, estado: "pendiente", error: "", n: 0, borrador: txt };
+      S.archivos.push(a); S.borradorLibre = "";
+    }
+    S.facturas = S.facturas.filter(f => f.archivoId !== a.id);
+    comps.forEach((c, i) => S.facturas.push(normalizarFactura(c, a, i, comps.length)));
+    a.estado = "ok"; a.n = comps.length; a.error = "";
+    dibujarArchivos(); dibujarFacturas(); actualizarBotones();
+    const pend = S.archivos.filter(x => x.url && x.estado !== "ok").length;
+    toast(`${comps.length} comprobante(s) agregados.${pend ? ` Faltan ${pend} página(s).` : " Todas las páginas listas."}`);
+  }));
+}
+if (C.MODO_LECTURA === "copilot") {
+  $("#guiaCopilot").classList.remove("oculto");
+  $("#bExtraer").classList.add("oculto");
+  $("#aCopilot").href = C.URL_COPILOT;
+  $("#zFact small").textContent = "La app separa cada página en una imagen para pasarla por Copilot";
+  $("#bCopiarPrompt").addEventListener("click", async () => toast(await copiarTexto(PROMPT_COPILOT) ? "Instrucciones copiadas. Pégalas en Copilot Chat." : "No se pudo copiar; selecciona y copia manualmente.", 4500));
+}
+
+const OPC = {
+  categoria: [["alimentacion", "Alimentación"], ["hospedaje", "Hospedaje"], ["transporte", "Transporte"], ["combustible", "Combustible"], ["parqueo", "Parqueo"], ["otros", "Otros"]],
+  tiempo: [["", "—"], ["desayuno", "Desayuno"], ["almuerzo", "Almuerzo"], ["cena", "Cena"]],
+  regimen: [["auto", "Auto"], ["viaje", "Viaje"], ["gira", "Gira"], ["viaticos", "Viáticos"], ["backoffice", "Back-office"], ["sin_limite", "Sin límite"]]
+};
+const COLS_FACT = [
+  ["numero", "No. factura", "text", 110], ["fecha", "Fecha", "date"], ["hora", "Hora", "text", 56], ["proveedor", "Proveedor", "text", 170],
+  ["pais", "País", "text", 100], ["categoria", "Categoría", "select"], ["tiempo", "Comida", "select"], ["personas", "Pers.", "int", 48],
+  ["noches", "Noches", "int", 52], ["moneda", "Mon.", "text", 52], ["impuesto", "IVA", "num", 72], ["propina", "Propina", "num", 72],
+  ["total", "Total s/propina", "num", 90], ["regimen", "Régimen", "select"]
+];
+function dibujarFacturas() {
+  $("#factEdit").classList.toggle("oculto", !S.facturas.length);
+  const inp = (f, [k, , t, w]) => {
+    if (t === "select") return `<select data-k="${k}">${OPC[k].map(([v, l]) => `<option value="${v}" ${String(f[k] ?? "") === v ? "selected" : ""}>${l}</option>`).join("")}</select>`;
+    return `<input type="${t === "date" ? "date" : "text"}" data-k="${k}" data-t="${t}" value="${esc(f[k] ?? "")}" style="${w ? `width:${w}px;` : ""}${t === "num" || t === "int" ? "text-align:right" : ""}">`;
+  };
+  $("#tFact").innerHTML = `<thead><tr><th>Archivo</th>${COLS_FACT.map(([, l, t]) => `<th class="${t === "num" ? "num" : ""}">${l}</th>`).join("")}<th>Lectura</th><th></th></tr></thead><tbody>` +
+    S.facturas.map(f => {
+      const conf = f.confianza === null ? "" : f.legible && f.confianza >= G().confianza_minima
+        ? `<span class="chip ok">${Math.round(f.confianza * 100)} %</span>`
+        : `<span class="chip warn" title="${esc(f.observaciones)}">${f.legible ? Math.round(f.confianza * 100) + " %" : "Ilegible"}</span>`;
+      const vis = f.visibilidad === "parcial" ? `<span class="chip warn" title="${esc((f.no_visibles || []).join(", "))}">Parcial</span>` : f.visibilidad === "ilegible" ? '<span class="chip error">Ilegible</span>' : "";
+      const fiscal = f.es_fiscal === false ? '<span class="chip warn">No fiscal</span>' : "";
+      return `<tr data-id="${f.id}">
+        <td class="mini" style="min-width:150px;max-width:200px">${vis} ${fiscal} ${esc(f.archivo)}${f.alternos?.length ? `<div class="muted">Otros números: ${esc(f.alternos.join(", "))}</div>` : ""}${f.items ? `<div class="muted">${esc(f.items)}</div>` : ""}${f.observaciones ? `<div style="color:var(--warn)">${esc(f.observaciones)}</div>` : ""}</td>
+        ${COLS_FACT.map(c => `<td>${inp(f, c)}</td>`).join("")}
+        <td>${f.editada ? '<span class="chip na">Editada</span>' : conf}</td>
+        <td><button class="btn chico" data-borrar="${f.id}" title="Quitar">✕</button></td></tr>`;
+    }).join("") + "</tbody>";
+  $$("#tFact input, #tFact select").forEach(el => el.addEventListener("change", () => {
+    const f = S.facturas.find(x => x.id === el.closest("tr").dataset.id);
+    const k = el.dataset.k, t = el.dataset.t;
+    if (t === "num") f[k] = parseNum(el.value);
+    else if (t === "int") f[k] = parseInt(el.value, 10) || null;
+    else if (k === "moneda") f[k] = normMoneda(el.value) || "";
+    else if (k === "pais") f[k] = infoPais(el.value)?.pais || el.value.trim();
+    else f[k] = el.value.trim();
+    if (el.tagName === "INPUT") el.value = f[k] ?? "";
+    f.editada = true; S.resultados = null;
+  }));
+  $$("[data-borrar]").forEach(b => b.addEventListener("click", () => { S.facturas = S.facturas.filter(f => f.id !== b.dataset.borrar); dibujarFacturas(); actualizarBotones(); }));
+  actualizarBotones();
+}
+$("#bAgregarManual").addEventListener("click", () => {
+  S.facturas.push({ id: uid(), archivoId: null, archivo: "Ingreso manual", numero: "", serie: "", clave: "", fecha: null, hora: "", proveedor: "", nit: "", receptor: "",
+    pais: S.paisEmpresa, moneda: S.monedaLocal, categoria: "otros", tiempo: "", personas: null, noches: null, impuesto: null, iva_incluido: true, propina: null,
+    total: null, total_pagado: null, items: "", tipo_documento: "", legible: true, confianza: null, observaciones: "", regimen: "auto", editada: true });
+  dibujarFacturas();
+});
+$("#sRegimen").addEventListener("change", e => { S.regimen = e.target.value; });
+
+function actualizarBotones() {
+  const pend = S.archivos.filter(a => a.estado === "pendiente").length;
+  $("#bExtraer").disabled = S.procesando || !pend;
+  $("#bExtraer").textContent = pend ? `Leer ${pend} archivo${pend === 1 ? "" : "s"}/página${pend === 1 ? "" : "s"}` : "Leer facturas";
+  const faltan = CAMPOS_EXCEL.filter(([k, , req]) => req && S.excel.map[k] === undefined).map(([, l]) => l);
+  const msg = !S.excel.raw.length ? "Falta el Excel" : faltan.length ? "Mapea: " + faltan.join(", ") : !S.lineas.length ? "Indica un número de informe válido" : !S.facturas.length ? "Faltan facturas leídas" : !S.monedaLocal ? "Elige la moneda local" : "";
+  $("#bComparar").disabled = S.procesando || !!msg;
+  $("#compInfo").textContent = msg;
+}
+
+/* =====================================================================
+   PASO 3 — MOTOR DE COMPARACIÓN
+   ===================================================================== */
+/**
+ * Compara un monto de la factura (en su moneda) contra una línea de SAP.
+ * campo = "monto" o "propina". SAP trae el importe en la moneda de la transacción
+ * (que puede ser la de la factura o USD) y el importe convertido a moneda local.
+ */
+function compararImporte(valor, monedaFact, l, campo) {
+  const imp = campo === "propina" ? l.propina : l.monto;
+  const loc = campo === "propina" ? l.propina_local : l.monto_local;
+  const local = S.monedaLocal, m = monedaFact || local;
+  if (valor === null || valor === undefined || imp === null || imp === undefined) return { st: "na", nota: "" };
+  const g = G(), tolA = g.tol_monto_abs, tolP = g.tol_monto_pct / 100, tolTc = g.tol_tc_pct / 100;
+  const stMonto = (a, b) => Math.abs(a - b) <= tolA ? "ok" : rel(a, b) <= tolP ? "warn" : "error";
+  if (m === local) {
+    const st = stMonto(Math.abs(valor), Math.abs(imp));
+    return { st, nota: st === "ok" ? "" : `Diferencia ${mm(m, Math.abs(valor) - Math.abs(imp))}`, interp: "misma" };
+  }
+  // a) Registrado en la moneda de la factura
+  if (Math.abs(valor - imp) <= tolA || rel(valor, imp) <= tolP) {
+    const implicito = imp ? loc / imp : null, ref = convertir(1, m, local);
+    let st = Math.abs(valor - imp) <= tolA ? "ok" : "warn", nota = `Registrado en ${m}`;
+    if (implicito && ref) {
+      nota += ` · TC aplicado ${implicito.toFixed(4)} ${local}/${m} (ref. ${ref.toFixed(4)})`;
+      const dev = rel(implicito, ref);
+      if (dev > tolTc) { st = "warn"; nota += ` · desvío ${(dev * 100).toFixed(1)} %`; }
+    } else if (!ref) { st = "warn"; nota += ` · falta TC de referencia ${m}/${local}`; }
+    return { st, nota, interp: "moneda_factura" };
+  }
+  // b) Registrado en USD (conversión del colaborador)
+  const usd = convertir(valor, m, "USD");
+  if (usd !== null && m !== "USD" && rel(imp, usd) <= tolTc) {
+    const implicito = imp ? loc / imp : null, ref = convertir(1, "USD", local);
+    let st = "ok", nota = `Registrado en USD: ${mm(m, valor)} ≈ USD ${money(usd)} (ref.) vs USD ${money(imp)}`;
+    if (local !== "USD" && implicito && ref && rel(implicito, ref) > tolTc) { st = "warn"; nota += ` · TC USD→${local} aplicado ${implicito.toFixed(4)} (ref. ${ref.toFixed(4)})`; }
+    return { st, nota, interp: "usd" };
+  }
+  // c) Comparación en moneda local
+  const enLocal = convertir(valor, m, local);
+  if (enLocal !== null && loc) {
+    const d = rel(loc, enLocal);
+    if (d <= tolTc) return { st: "ok", nota: `Convertido: ${mm(m, valor)} ≈ ${mm(local, enLocal)} vs ${mm(local, loc)} en SAP`, interp: "local" };
+    return { st: d <= tolTc * 2 ? "warn" : "error", nota: `No cuadra con TC de referencia: ${mm(m, valor)} ≈ ${mm(local, enLocal)} vs ${mm(local, loc)} en SAP (${(d * 100).toFixed(1)} %)`, interp: "local" };
+  }
+  return { st: "warn", nota: `Moneda ${m} sin tipo de cambio configurado; SAP: ${money(imp)} / ${mm(local, loc)}` };
+}
+
+function puntaje(f, l) {
+  let s = 0;
+  const num = matchNumero(f, l.numero);
+  if (num === "exacto") s += 50; else if (num === "parcial") s += 35; else if (num === "alterno") s += 28;
+  if (!l.solo_propina) {
+    const a = compararImporte(f.total, f.moneda, l, "monto");
+    if (a.st === "ok") s += 25; else if (a.st === "warn") s += 15;
+    else if (f.impuesto > 0) { const c = compararImporte((f.total || 0) + f.impuesto, f.moneda, l, "monto"); if (c.st === "ok" || c.st === "warn") s += 18; }
+    else if (f.propina) { const b = compararImporte((f.total || 0) + f.propina, f.moneda, l, "monto"); if (b.st === "ok" || b.st === "warn") s += 18; }
+  }
+  const sim = simNombre(f.proveedor, l.proveedor);
+  if (sim !== null && sim >= 0.5) s += 10 * sim;
+  const dd = f.fecha && l.fecha_gasto ? Math.abs(difDiasFirmado(f.fecha, l.fecha_gasto)) : null;
+  if (dd === 0) s += 8; else if (dd !== null && dd <= G().tol_fecha_dias) s += 4;
+  return { s, num };
+}
+
+function ivaEstimado(f) {
+  if (f.impuesto !== null && f.impuesto !== undefined) return { iva: f.impuesto, est: false };
+  if (!f.iva_incluido || f.total === null) return { iva: null, est: false };
+  const ip = infoPais(f.pais || S.paisEmpresa);
+  if (!ip || !ip.iva_pct) return { iva: null, est: false };
+  return { iva: f.total - f.total / (1 + ip.iva_pct / 100), est: true, pct: ip.iva_pct };
+}
+
+function evaluarPar(f, l, num) {
+  const campos = [], notas = [], g = G();
+  const m = f.moneda || S.monedaLocal;
+  // Si el número no coincide pero monto y proveedor sí (ej. tiquetes sin número donde SAP usa fecha-hora), es advertencia
+  const simP = simNombre(f.proveedor, l.proveedor), montoOk = compararImporte(f.total, f.moneda, l, "monto").st === "ok";
+  const sinNumeroVisible = !f.numero && (f.visibilidad !== "completa" || (f.no_visibles || []).some(x => /num/i.test(x)));
+  campos.push({ c: "No. factura",
+    st: num === "exacto" || num === "parcial" ? "ok" : num === "alterno" ? "warn" : (montoOk && simP >= 0.8) || (sinNumeroVisible && montoOk) ? "warn" : "error",
+    nota: num === "parcial" ? "coincide parcialmente" : num === "alterno" ? `SAP registró un número secundario del comprobante (tiquete/orden), no el número fiscal ${f.numero || ""}`.trim()
+      : num ? "" : sinNumeroVisible ? "el número no es visible en el comprobante; emparejado por monto, proveedor y fecha"
+      : `número distinto (${f.numero || "sin número"} vs ${l.numero})${montoOk && simP >= 0.8 ? "; emparejado por monto y proveedor" : ""}` });
+  // Total (sin propina)
+  if (l.solo_propina) campos.push({ c: "Total", st: "error", nota: "En SAP solo se registró la propina, sin la línea de la factura" });
+  else {
+    let r = compararImporte(f.total, f.moneda, l, "monto");
+    if (r.st === "error" && f.impuesto > 0) {
+      const r3 = compararImporte((f.total || 0) + f.impuesto, f.moneda, l, "monto");
+      if (r3.st === "ok" || r3.st === "warn") r = { st: "warn", nota: `Coincide sumando el IVA (${money(f.impuesto)}): la lectura tomó el subtotal; corrige el total en la tabla de datos leídos` };
+    }
+    if (r.st === "error" && f.propina) {
+      const r2 = compararImporte((f.total || 0) + f.propina, f.moneda, l, "monto");
+      if (r2.st === "ok" || r2.st === "warn") r = { st: "warn", nota: "El importe en SAP incluye la propina; debería registrarse aparte (-P). " + r2.nota };
+    }
+    campos.push({ c: "Total", st: r.st, nota: r.nota });
+  }
+  // Propina
+  const fP = f.propina || 0, eP = l.propina || 0;
+  if (eP > 0 && fP <= 0) campos.push({ c: "Propina", st: "error", nota: `Propina de ${money(eP)} registrada sin respaldo en la factura` });
+  else if (eP > 0) { const r = compararImporte(fP, f.moneda, l, "propina"); campos.push({ c: "Propina", st: r.st, nota: r.nota }); }
+  else if (fP > 0) campos.push({ c: "Propina", st: "na", nota: `La factura trae propina de ${mm(m, fP)} que no se reclamó` });
+  if (eP > 0 && l.monto) {
+    const pct = eP / l.monto * 100;
+    if (pct > g.propina_max_pct + 0.05) campos.push({ c: "Propina %", st: "warn", nota: `Propina de ${pct.toFixed(1)} % supera el máximo de ${g.propina_max_pct} %` });
+  }
+  if (l.propina_imp > 0) campos.push({ c: "IVA propina", st: "warn", nota: `La línea de propina tiene impuesto registrado (${money(l.propina_imp)}); la propina no lleva IVA` });
+  // IVA: solo se reclama si la factura lo desglosa explícitamente (un "IVA incluido" o "Total ivi" no da derecho a reclamarlo)
+  if (!l.solo_propina) {
+    const ivaFact = f.impuesto !== null && f.impuesto !== undefined && f.impuesto > 0.01 ? f.impuesto : 0;
+    const ivaSap = l.impuesto > 0.01 ? l.impuesto : 0;
+    const mismaMoneda = !f.moneda || f.moneda === S.monedaLocal || Math.abs((f.total || 0) - (l.monto || 0)) <= g.tol_monto_abs;
+    const ip = infoPais(f.pais || S.paisEmpresa);
+    const exigeDesglose = ip?.iva_desglosado !== false;
+    if (!ivaFact && ivaSap && !exigeDesglose && f.iva_incluido && mismaMoneda) {
+      // País donde el IVA incluido sí se puede reclamar: se estima y se compara
+      const est = ivaEstimado(f).iva;
+      const st = est !== null && Math.abs(est - ivaSap) <= Math.max(g.tol_monto_abs, ivaSap * 0.02) ? "ok" : "warn";
+      campos.push({ c: "IVA", st, nota: est === null ? "No se pudo estimar el IVA incluido" : st === "ok" ? `incluido, estimado al ${ip.iva_pct} %` : `IVA incluido estimado ${money(est)} vs ${money(ivaSap)} en SAP` });
+    }
+    else if (!ivaFact && ivaSap)
+      campos.push({ c: "IVA", st: "warn", nota: `SAP reclama IVA de ${money(ivaSap)} (código ${l.codigo_impuesto || "—"}) pero la factura no lo desglosa` });
+    else if (ivaFact && !ivaSap)
+      campos.push({ c: "IVA", st: "na", nota: `La factura desglosa IVA de ${money(ivaFact)} que no se reclamó en SAP` });
+    else if (ivaFact && ivaSap && mismaMoneda) {
+      const st = Math.abs(ivaFact - ivaSap) <= Math.max(g.tol_monto_abs, ivaSap * 0.02) ? "ok" : "warn";
+      campos.push({ c: "IVA", st, nota: st === "ok" ? "" : `IVA ${money(ivaFact)} en la factura vs ${money(ivaSap)} en SAP` });
+    }
+  }
+  // Fecha de la factura vs "Fecha de gasto" de SAP
+  if (!f.fecha) campos.push({ c: "Fecha", st: "warn", nota: "Factura sin fecha legible" });
+  else if (!l.fecha_gasto) campos.push({ c: "Fecha", st: "na", nota: "La línea de SAP no tiene fecha de gasto" });
+  else {
+    const d = Math.abs(difDiasFirmado(f.fecha, l.fecha_gasto));
+    campos.push({ c: "Fecha", st: d === 0 ? "ok" : d <= (g.tol_fecha_dias ?? 1) ? "warn" : "error",
+      nota: d === 0 ? "" : `factura ${f.fecha} vs gasto ${l.fecha_gasto} (${d} día${d === 1 ? "" : "s"})` });
+  }
+  // Proveedor
+  const sim = simNombre(f.proveedor, l.proveedor);
+  if (sim !== null) campos.push({ c: "Proveedor", st: sim >= 0.8 ? "ok" : sim >= 0.4 ? "warn" : "error", nota: sim < 0.8 ? `similitud ${Math.round(sim * 100)} %` : "" });
+  // Receptor: "BTICINO CR" = "Bticino Costa Rica S.A" (se ignoran país, código de país y forma societaria)
+  if (f.receptor && S.cab?.empresa && !receptorEsEmpresa(f.receptor, S.cab.empresa))
+    campos.push({ c: "Receptor", st: "warn", nota: `Factura a nombre de "${f.receptor}", no de la empresa` });
+  // Visibilidad y validez fiscal
+  if (f.visibilidad && f.visibilidad !== "completa")
+    campos.push({ c: "Visibilidad", st: "warn", nota: `comprobante ${f.visibilidad === "ilegible" ? "casi ilegible" : "no 100 % visible"}${f.no_visibles?.length ? ": no se ve " + f.no_visibles.join(", ") : ""}; verificar contra el documento` });
+  if (f.es_fiscal === false)
+    campos.push({ c: "Documento", st: "warn", nota: `no es un comprobante fiscal (${f.tipo_documento || "pedido / voucher / recibo"})` });
+  // Calidad de lectura
+  if (!f.legible && f.visibilidad === "completa") notas.push("Comprobante marcado como ilegible: verificar contra el documento.");
+  else if (f.confianza !== null && f.confianza < g.confianza_minima && !f.editada) notas.push(`Lectura con confianza baja (${Math.round(f.confianza * 100)} %): verificar manualmente.`);
+  if (f.observaciones) notas.push("IA: " + f.observaciones);
+  if (/credito/.test(normTxt(f.tipo_documento))) notas.push("El documento es una nota de crédito.");
+  if (/recibo/.test(normTxt(f.tipo_documento))) notas.push("Es un recibo, no una factura electrónica.");
+  return { campos, notas };
+}
+function nucleoEmpresa(txt) {
+  let t = " " + normTxt(txt).replace(RUIDO, " ") + " ";
+  (P().paises || []).forEach(p => {
+    [normTxt(p.pais), ...(p.codigos || []).map(c => normTxt(c))].filter(Boolean).forEach(x => { t = t.replace(new RegExp(` ${x} `, "g"), " "); });
+  });
+  ["cr", "gt", "sv", "hn", "ni", "pa", "do", "rd", "ec", "mx", "us", "guatemala", "costa rica", "salvador", "honduras", "nicaragua", "panama", "dominicana", "republica"].forEach(x => { t = t.replace(new RegExp(` ${x} `, "g"), " "); });
+  return t.replace(/\s+/g, " ").trim();
+}
+function receptorEsEmpresa(receptor, empresa) {
+  const a = nucleoEmpresa(receptor), b = nucleoEmpresa(empresa);
+  if (!a || !b) return true;
+  const sa = a.replace(/ /g, ""), sb = b.replace(/ /g, "");
+  return sa.includes(sb) || sb.includes(sa) || (simNombre(a, b) ?? 1) >= 0.5;
+}
+const RANGO = { ok: 0, na: 0, warn: 1, error: 2 };
+function ajustar(x, st) { (x.ajustes ||= []).push(st); x.estado = peor([x.estado, st]); }
+const CAMPOS_PROPINA = ["Propina", "Propina %", "IVA propina"];
+/**
+ * Vista "una fila por línea de SAP": cada comprobante emparejado da su fila principal y una fila
+ * por cada línea de propina (-P, -A…), todas en el orden del ID de gastos de SAP.
+ */
+function filasVista(R) {
+  const filas = [];
+  R.resultados.forEach(x => {
+    const l = x.linea, propinas = l?.propinas || [];
+    const camposFact = (x.campos || []).filter(c => !CAMPOS_PROPINA.includes(c.c));
+    const camposProp = (x.campos || []).filter(c => CAMPOS_PROPINA.includes(c.c));
+    if (!l || !l.solo_propina) {
+      const estado = x.tipo === "par" ? peor([...camposFact.map(c => c.st), ...(x.ajustes || [])]) : x.estado;
+      filas.push({ tipo: "principal", x, id: l ? l.id_gasto : null, estado, campos: x.tipo === "par" && propinas.length ? camposFact : (x.campos || []), notas: x.notas || [] });
+    }
+    propinas.forEach(t => {
+      let estado, campos = camposProp, notas = [];
+      if (!x.factura) { estado = "error"; notas = [l.solo_propina ? "Propina registrada en SAP sin la factura base ni comprobante." : "Propina sin comprobante de respaldo."]; campos = []; }
+      else if (!camposProp.length) { estado = "ok"; campos = [{ c: "Propina", st: "ok", nota: "respaldada por el comprobante" }]; }
+      else {
+        estado = peor(camposProp.map(c => c.st));
+        if (estado === "ok") campos = camposProp.map(c => c.c === "Propina" && !c.nota ? { ...c, nota: "respaldada por el comprobante" } : c);
+      }
+      filas.push({ tipo: "propina", x, tip: t, id: t.id_gasto, estado, campos, notas });
+    });
+    if (l && !propinas.length && (l.filas_propina || []).length) { /* revisiones antiguas sin detalle de propina: se muestran agrupadas */ }
+  });
+  const ordenF = new Map(R.resultados.map((x, i) => [x, i]));
+  return filas.sort((a, b) => (a.id !== null && b.id !== null) ? (numGasto(a.id) - numGasto(b.id) || String(a.id).localeCompare(String(b.id)) || (a.tipo === "propina") - (b.tipo === "propina"))
+    : a.id !== null ? -1 : b.id !== null ? 1 : ordenF.get(a.x) - ordenF.get(b.x));
+}
+const peor = arr => arr.reduce((a, b) => (RANGO[b] > RANGO[a] ? b : a), "ok");
+
+/* ---------- Límites de política ---------- */
+function regimenDe(f) {
+  const r = f.regimen && f.regimen !== "auto" ? f.regimen : S.regimen;
+  if (r !== "auto") return r;
+  const pf = normPais(f.pais);
+  if (!pf || pf === normPais(S.paisEmpresa)) return G().nacional_por_defecto;
+  return "viaje";
+}
+function tiempoDe(f) {
+  if (f.tiempo) return { t: f.tiempo, nota: "" };
+  if (f.hora) { const h = f.hora; return { t: h <= G().desayuno_hasta ? "desayuno" : h <= G().almuerzo_hasta ? "almuerzo" : "cena", nota: `según la hora ${h}` }; }
+  return { t: "almuerzo", nota: "sin hora: se asumió almuerzo/cena" };
+}
+function netoFactura(f, incluye) {
+  const total = f.total || 0, notas = [];
+  if (incluye) return { neto: total + (f.propina || 0), notas };
+  const { iva, est, pct } = ivaEstimado(f);
+  if (est) notas.push(`IVA estimado al ${pct} %`);
+  return { neto: total - (iva || 0), notas };
+}
+const NOMBRE_REG = { viaje: "Viaje", gira: "Gira", viaticos: "Viáticos", backoffice: "Back-office", sin_limite: "Sin límite" };
+function evaluarLimites(facturas) {
+  const g = G(), N = P().nacional, checks = [], grupos = new Map();
+  const etiqueta = f => `${f.proveedor || "Sin proveedor"}${f.numero ? " · " + f.numero : ""}`;
+  const cerrar = c => {
+    if (c.monto === null) { c.st = "warn"; c.notas.push(`Falta tipo de cambio para convertir a ${c.moneda}`); }
+    else { c.exceso = c.monto - c.limite; c.st = c.exceso > 0.01 ? "error" : "ok"; }
+    checks.push(c);
+  };
+  const sinRegion = (f, reg, concepto) => checks.push({ fecha: f.fecha, regimen: reg, concepto, region: f.pais || "?", ids: [f.id], etiquetas: [etiqueta(f)],
+    monto: null, limite: null, moneda: "", st: "warn", notas: [`País "${f.pais || "sin país"}" sin región configurada en la política`] });
+  const acumular = (key, base, valor, f, notas) => {
+    if (!grupos.has(key)) grupos.set(key, { ...base, ids: [], etiquetas: [], monto: 0, notas: [] });
+    const gr = grupos.get(key);
+    gr.ids.push(f.id); gr.etiquetas.push(etiqueta(f));
+    gr.monto = gr.monto === null || valor === null ? null : gr.monto + valor;
+    notas.forEach(n => { if (!gr.notas.includes(n)) gr.notas.push(n); });
+  };
+  for (const f0 of facturas) {
+    if (!["alimentacion", "hospedaje"].includes(f0.categoria)) continue;
+    const f = f0.fecha ? f0 : { ...f0, fecha: f0._fechaLinea || null };
+    const reg = regimenDe(f);
+    if (reg === "sin_limite") continue;
+    const mon = f.moneda || S.monedaLocal;
+    const pers = g.por_persona ? Math.max(1, +f.personas || 1) : 1;
+    const notasP = pers > 1 ? [`${etiqueta(f)}: ${pers} personas, límite por persona`] : [];
+    if (f.categoria === "hospedaje") {
+      const noches = Math.max(1, +f.noches || 1);
+      let lim = N.gira_hospedaje_noche, region = "";
+      if (reg === "viaje") {
+        const r = regionDe(P().viajes_hospedaje, f.pais);
+        if (!r) { sinRegion(f, reg, "Hospedaje"); continue; }
+        lim = { monto: r.monto, moneda: r.moneda, incluye: false }; region = r.region;
+      }
+      const { neto, notas } = netoFactura(f, lim.incluye);
+      cerrar({ fecha: f.fecha, regimen: reg, concepto: `Hospedaje por noche${noches > 1 ? ` (${noches} noches)` : ""}`, region, ids: [f.id], etiquetas: [etiqueta(f)],
+        monto: convertir(neto / noches, mon, lim.moneda), limite: lim.monto, moneda: lim.moneda, notas: [...notas, ...(f.noches ? [] : ["sin dato de noches: se asumió 1"])] });
+      continue;
+    }
+    // Alimentación
+    const { t, nota: notaT } = tiempoDe(f);
+    const notasT = notaT ? [`${etiqueta(f)}: ${t} ${notaT}`] : [];
+    if (reg === "viaticos" || reg === "backoffice") {
+      const lim = reg === "viaticos" ? N.viaticos_comida : N.backoffice_comida;
+      const { neto, notas } = netoFactura(f, lim.incluye);
+      cerrar({ fecha: f.fecha, regimen: reg, concepto: `${lim.concepto} · ${t}`, region: "", ids: [f.id], etiquetas: [etiqueta(f)],
+        monto: convertir(neto / pers, mon, lim.moneda), limite: lim.monto, moneda: lim.moneda, notas: [...notas, ...notasP, ...notasT] });
+    } else if (reg === "gira") {
+      const lim = N.gira_alimentacion_dia;
+      const { neto, notas } = netoFactura(f, lim.incluye);
+      acumular(`gira|${f.fecha || "sin fecha"}`, { fecha: f.fecha, regimen: reg, concepto: lim.concepto, region: "", limite: lim.monto, moneda: lim.moneda },
+        convertir(neto / pers, mon, lim.moneda), f, [...notas, ...notasP]);
+    } else {
+      const r = regionDe(P().viajes_alimentacion, f.pais);
+      if (!r) { sinRegion(f, reg, "Alimentación"); continue; }
+      const { neto, notas } = netoFactura(f, false);
+      const valor = convertir(neto / pers, mon, r.moneda);
+      const extra = [...notas, ...notasP, ...notasT];
+      if (t === "desayuno") acumular(`viaje|${f.fecha}|${r.region}|des`, { fecha: f.fecha, regimen: reg, concepto: "Desayuno", region: r.region, limite: r.desayuno, moneda: r.moneda }, valor, f, extra);
+      else if (g.almuerzo_cena_modo === "dia") acumular(`viaje|${f.fecha}|${r.region}|ac`, { fecha: f.fecha, regimen: reg, concepto: "Almuerzo y cena (tope diario)", region: r.region, limite: r.almuerzo_cena, moneda: r.moneda }, valor, f, extra);
+      else cerrar({ fecha: f.fecha, regimen: reg, concepto: t === "cena" ? "Cena" : "Almuerzo", region: r.region, ids: [f.id], etiquetas: [etiqueta(f)], monto: valor, limite: r.almuerzo_cena, moneda: r.moneda, notas: extra });
+    }
+  }
+  grupos.forEach(gr => { if (!gr.fecha) gr.notas.push("Facturas sin fecha agrupadas juntas"); cerrar(gr); });
+  checks.sort((a, b) => String(a.fecha || "9").localeCompare(String(b.fecha || "9")) || a.concepto.localeCompare(b.concepto));
+  return checks;
+}
+
+function comparar() {
+  const lineas = S.lineas, facturas = S.facturas;
+  const pares = [];
+  facturas.forEach((f, i) => lineas.forEach((l, j) => { const p = puntaje(f, l); if (p.s >= 32) pares.push({ i, j, ...p }); }));
+  pares.sort((a, b) => b.s - a.s);
+  const usadasF = new Set(), usadasL = new Set(), res = [];
+  for (const p of pares) {
+    if (usadasF.has(p.i) || usadasL.has(p.j)) continue;
+    usadasF.add(p.i); usadasL.add(p.j);
+    const f = facturas[p.i], l = lineas[p.j];
+    const { campos, notas } = evaluarPar(f, l, p.num);
+    let st = peor(campos.map(c => c.st));
+    const ajustes = notas.some(n => /ilegible|confianza baja/.test(n)) ? ["warn"] : [];
+    st = peor([st, ...ajustes]);
+    f._fechaLinea = l.fecha_gasto;
+    res.push({ tipo: "par", estado: st, factura: f, linea: l, campos, notas, ajustes, puntaje: Math.round(p.s) });
+  }
+  facturas.forEach((f, i) => { if (!usadasF.has(i)) res.push({ tipo: "factura_sola", estado: "error", factura: f, linea: null, campos: [], notas: ["Comprobante sin línea correspondiente en el informe de SAP."]
+    .concat(f.visibilidad !== "completa" ? [`Comprobante no 100 % visible${f.no_visibles?.length ? " (no se ve: " + f.no_visibles.join(", ") + ")" : ""}: puede que no se haya podido emparejar por eso; corrige los datos en la tabla y vuelve a comparar.`] : [])
+    .concat(f.observaciones ? ["IA: " + f.observaciones] : []) }); });
+  lineas.forEach((l, j) => { if (!usadasL.has(j)) res.push({ tipo: "linea_sola", estado: "error", factura: null, linea: l, campos: [], notas: [l.solo_propina ? "Propina registrada en SAP sin la factura base ni comprobante." : "Línea de SAP sin comprobante de respaldo."] }); });
+  // Duplicados
+  const claveF = f => f.numero ? alfanum(f.proveedor).slice(0, 6) + "|" + soloDigitos(f.numero) : null;
+  const cuenta = (lista, key) => { const c = {}; lista.forEach(x => { const k = key(x); if (k) c[k] = (c[k] || 0) + 1; }); return c; };
+  const dupF = cuenta(facturas, claveF), dupL = cuenta(lineas, l => soloDigitos(l.numero) || null);
+  res.forEach(x => {
+    const kf = x.factura && claveF(x.factura);
+    if (kf && dupF[kf] > 1) { x.notas.push("Comprobante duplicado: el mismo número aparece más de una vez en los archivos."); ajustar(x, "warn"); }
+    const kl = x.linea && soloDigitos(x.linea.numero);
+    if (kl && dupL[kl] > 1) { x.notas.push("ID de factura repetido en el informe de SAP."); ajustar(x, "error"); }
+  });
+  // Límites
+  const limites = evaluarLimites(facturas);
+  const porFactura = {};
+  limites.forEach(c => c.ids.forEach(id => (porFactura[id] ||= []).push(c)));
+  res.forEach(x => {
+    if (!x.factura) return;
+    (porFactura[x.factura.id] || []).filter(c => c.st !== "ok").forEach(c => {
+      x.notas.push(c.st === "error"
+        ? `Excede límite "${c.concepto}"${c.region ? " · " + c.region : ""}${c.fecha ? " del " + c.fecha : ""}: ${mm(c.moneda, c.monto)} vs ${mm(c.moneda, c.limite)} (exceso ${mm(c.moneda, c.exceso)})`
+        : `Límite no evaluable: ${c.notas.join("; ")}`);
+      ajustar(x, c.st);
+    });
+  });
+  // Mismo orden que SAP: por ID de gastos; los comprobantes sin línea van al final en el orden en que se leyeron
+  const ordenF = new Map(facturas.map((f, i) => [f.id, i]));
+  res.sort((a, b) => (a.linea && b.linea) ? ordenGasto(a.linea, b.linea) : a.linea ? -1 : b.linea ? 1 : (ordenF.get(a.factura?.id) ?? 0) - (ordenF.get(b.factura?.id) ?? 0));
+  // Totales en moneda local
+  const local = S.monedaLocal;
+  const totFactLocal = facturas.reduce((s, f) => { const v = convertir((f.total || 0) + (f.propina || 0), f.moneda || local, local); return v === null ? s : s + v; }, 0);
+  const totSap = lineas.reduce((s, l) => s + (l.monto_local || 0) + (l.propina_local || 0), 0);
+  return { resultados: res, limites, cab: clonar(S.cab), monedaLocal: local, paisEmpresa: S.paisEmpresa, regimen: S.regimen,
+    totalFacturas: facturas.length, totalLineas: lineas.reduce((n, l) => n + (l.filas?.length || 0) + (l.filas_propina?.length || 0), 0), totFactLocal, totSap };
+}
+
+$("#bComparar").addEventListener("click", () => {
+  S.resultados = comparar();
+  renderResultados($("#resultados"), S.resultados, { editable: true });
+  $("#resultados").classList.remove("oculto");
+  $("#resultados").scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+/* =====================================================================
+   RESULTADOS (se reutiliza en el historial)
+   ===================================================================== */
+const ICONO = { ok: "✅", warn: "⚠️", error: "❌", na: "ℹ️" };
+const TXT_ESTADO = { ok: "Coincide", warn: "Advertencia", error: "Discrepancia" };
+function conteos(R) { const c = { ok: 0, warn: 0, error: 0 }; filasVista(R).forEach(v => c[v.estado === "na" ? "ok" : v.estado]++); return c; }
+const nombreEstado = e => ({ aprobado: "Aprobado", con_observaciones: "Con observaciones", rechazado: "Rechazado" }[e] || e || "—");
+
+function renderResultados(cont, R, { editable = false, registro = null } = {}) {
+  const vista = filasVista(R), c = conteos(R), lim = R.limites || [];
+  const exc = lim.filter(x => x.st === "error").length;
+  const fid = "flt_" + uid(), ml = R.monedaLocal || "", cab = R.cab || {};
+  cont.innerHTML = `
+  <div class="tarjeta">
+    <div class="fila" style="justify-content:space-between;align-items:center;margin-bottom:6px">
+      <h2 style="margin:0">Resultado · Informe ${esc(cab.informe || registro?.informe_id || "")}</h2>
+      <div class="fila"><button class="btn" data-acc="excel">Exportar a Excel</button>
+        ${registro && (registro.user_id === sesionUid || S.esAdmin) ? `<button class="btn" data-acc="borrar">Eliminar</button>` : ""}</div>
+    </div>
+    <p class="sub">${esc([cab.empleado, cab.texto, cab.empresa].filter(Boolean).join(" · "))} · moneda local ${esc(ml)}
+      ${registro ? `<br>Revisado por <b>${esc(registro.revisado_por || registro.user_email)}</b>${registro.revisado_por && registro.revisado_por !== registro.user_email ? ` (${esc(registro.user_email)})` : ""} el ${new Date(registro.created_at).toLocaleString("es-CR")} · Dictamen: <b>${esc(nombreEstado(registro.estado))}</b>${registro.comentario ? ` · ${esc(registro.comentario)}` : ""}` : ""}</p>
+    <div class="resumen">
+      <div class="kpi ok"><div class="v">${c.ok}</div><div class="l">Coinciden</div></div>
+      <div class="kpi warn"><div class="v">${c.warn}</div><div class="l">Advertencias</div></div>
+      <div class="kpi error"><div class="v">${c.error}</div><div class="l">Discrepancias</div></div>
+      <div class="kpi ${exc ? "error" : "ok"}"><div class="v">${exc}</div><div class="l">Límites excedidos</div></div>
+      <div class="kpi"><div class="v" style="font-size:16px">${esc(mm(ml, R.totFactLocal))}</div><div class="l">Comprobantes (${R.totalFacturas}) con propina, al TC de ref.</div></div>
+      <div class="kpi"><div class="v" style="font-size:16px">${esc(mm(ml, R.totSap))}</div><div class="l">Informe SAP (${R.totalLineas} líneas) en moneda local</div></div>
+    </div>
+    <div class="filtros" id="${fid}">
+      <button class="btn chico activo" data-f="todos">Todos (${vista.length})</button>
+      <button class="btn chico" data-f="error">❌ Discrepancias (${c.error})</button>
+      <button class="btn chico" data-f="warn">⚠️ Advertencias (${c.warn})</button>
+      <button class="btn chico" data-f="ok">✅ Coinciden (${c.ok})</button>
+    </div>
+    <div class="scroll" style="max-height:640px"><table>
+      <thead><tr><th>ID gasto</th><th></th><th>Línea SAP</th><th>Comprobante</th><th class="num">SAP</th><th class="num">Comprobante</th><th>Detalle</th></tr></thead>
+      <tbody>${vista.map(v => filaResultado(v, ml)).join("")}</tbody></table></div>
+
+    <h3>Control de límites de política</h3>
+    ${lim.length ? `<div class="scroll" style="max-height:420px"><table>
+      <thead><tr><th></th><th>Fecha</th><th>Régimen</th><th>Concepto</th><th>Comprobantes</th><th class="num">Monto neto</th><th class="num">Límite</th><th class="num">Exceso</th><th>Notas</th></tr></thead>
+      <tbody>${lim.map(x => `<tr><td>${ICONO[x.st]}</td><td class="mini">${esc(x.fecha || "—")}</td><td class="mini">${esc(NOMBRE_REG[x.regimen] || x.regimen)}</td>
+        <td>${esc(x.concepto)}${x.region ? `<div class="mini muted">${esc(x.region)}</div>` : ""}</td>
+        <td class="mini">${x.etiquetas.map(esc).join("<br>")}</td>
+        <td class="num">${esc(mm(x.moneda, x.monto))}</td><td class="num">${esc(mm(x.moneda, x.limite))}</td>
+        <td class="num" style="${x.exceso > 0.01 ? "color:var(--err);font-weight:600" : ""}">${x.exceso > 0.01 ? esc(mm(x.moneda, x.exceso)) : ""}</td>
+        <td class="mini muted">${x.notas.map(esc).join("<br>")}</td></tr>`).join("")}</tbody></table></div>`
+      : `<p class="muted mini">No hay comprobantes de alimentación u hospedaje sujetos a límite.</p>`}
+
+    ${editable ? `<div class="fila" style="margin-top:16px">
+      <div class="campo" style="max-width:220px"><label>Dictamen</label>
+        <select id="rEstado"><option value="aprobado">Aprobado</option><option value="con_observaciones">Con observaciones</option><option value="rechazado">Rechazado</option></select></div>
+      <div class="campo"><label>Comentario</label><input type="text" id="rComent" placeholder="Opcional: observaciones para el colaborador o contabilidad"></div>
+      <button class="btn primario" data-acc="guardar">Guardar en historial</button></div>` : ""}
+  </div>`;
+  if (editable) $("#rEstado", cont).value = c.error || exc ? "rechazado" : c.warn ? "con_observaciones" : "aprobado";
+  $$(`#${fid} button`, cont).forEach(b => b.addEventListener("click", () => {
+    $$(`#${fid} button`, cont).forEach(x => x.classList.toggle("activo", x === b));
+    $$("tbody tr[data-st]", cont).forEach(tr => tr.classList.toggle("oculto", b.dataset.f !== "todos" && tr.dataset.st !== b.dataset.f));
+  }));
+  $("[data-acc=excel]", cont).addEventListener("click", () => exportarExcel(R));
+  const bg = $("[data-acc=guardar]", cont); if (bg) bg.addEventListener("click", () => guardar(R, bg));
+  const bb = $("[data-acc=borrar]", cont); if (bb) bb.addEventListener("click", () => borrarRegistro(registro.id));
+}
+function filaResultado(v, ml) {
+  const x = v.x, f = x.factura, l = x.linea, st = v.estado === "na" ? "ok" : v.estado;
+  const chips = v.campos.filter(c => c.st !== "na" || c.nota).map(c => `<span class="chip ${c.st}">${ICONO[c.st]} ${esc(c.c)}${c.nota ? ": " + esc(c.nota) : ""}</span>`).join("");
+  const notas = v.notas.length ? `<ul class="notas">${v.notas.map(n => `<li>${esc(n)}</li>`).join("")}</ul>` : "";
+  if (v.tipo === "propina") {
+    const t = v.tip;
+    return `<tr data-st="${st}" style="background:#FCFCFD">
+      <td style="white-space:nowrap"><b style="font-size:15px">${esc(t.id_gasto)}</b><div class="mini muted">propina de ${esc(l.solo_propina ? "—" : l.id_gasto)}</div></td>
+      <td title="${TXT_ESTADO[st]}" style="font-size:16px">${ICONO[st]}</td>
+      <td><b>${esc(t.numero)}</b><div class="mini">${esc(l.proveedor)}</div><div class="mini muted">Gasto ${esc(t.fecha_gasto || l.fecha_gasto || "—")} · línea de propina</div></td>
+      <td class="mini">${f ? `Propina de la factura <b>${esc(f.numero || f.clave || "")}</b>` : '<span class="muted">— sin comprobante —</span>'}</td>
+      <td class="num">${money(t.monto)}${t.monto_local !== t.monto ? `<div class="mini muted">${esc(mm(ml, t.monto_local))}</div>` : ""}</td>
+      <td class="num">${f ? esc(mm(f.moneda, f.propina || 0)) : ""}</td>
+      <td><div class="det">${chips}</div>${notas}</td></tr>`;
+  }
+  const conPropinaAparte = (l?.propinas || []).length > 0;
+  return `<tr data-st="${st}">
+    <td style="white-space:nowrap"><b style="font-size:15px">${esc(l ? l.id_gasto : "—")}</b></td>
+    <td title="${TXT_ESTADO[st]}" style="font-size:16px">${ICONO[st]}</td>
+    <td style="min-width:170px">${l ? `<b>${esc(l.numero)}</b><div class="mini">${esc(l.proveedor)}</div><div class="mini muted">Gasto ${esc(l.fecha_gasto || "—")}${l.finalidad ? " · " + esc(l.finalidad) : ""}</div>` : '<span class="muted">— sin línea en SAP —</span>'}</td>
+    <td style="min-width:170px">${f ? `<b>${esc(f.numero || f.clave || "Sin número")}</b><div class="mini">${esc(f.proveedor)}</div><div class="mini muted">${esc([f.fecha, f.hora, f.pais, f.categoria].filter(Boolean).join(" · "))}</div><div class="mini muted">${esc(f.archivo)}</div>` : '<span class="muted">— sin comprobante —</span>'}</td>
+    <td class="num">${l ? `${money(l.monto)}${l.monto_local !== l.monto ? `<div class="mini muted">${esc(mm(ml, l.monto_local))}</div>` : ""}${!conPropinaAparte && l.propina ? `<div class="mini muted">+ propina ${money(l.propina)}</div>` : ""}` : ""}</td>
+    <td class="num">${f ? `${esc(mm(f.moneda, f.total))}${!conPropinaAparte && f.propina ? `<div class="mini muted">+ propina ${money(f.propina)}</div>` : ""}` : ""}</td>
+    <td><div class="det">${chips}</div>${notas}</td></tr>`;
+}
+
+function exportarExcel(R) {
+  const ml = R.monedaLocal || "";
+  const filas = filasVista(R).map(v => {
+    const x = v.x, f = x.factura, l = x.linea, t = v.tip, esProp = v.tipo === "propina";
+    return {
+      "ID de gasto": v.id ?? "", "Tipo": esProp ? "Propina" : "Factura", "Estado": TXT_ESTADO[v.estado === "na" ? "ok" : v.estado],
+      "ID factura SAP": esProp ? t.numero : (l?.numero ?? ""), "Proveedor SAP": l?.proveedor ?? "",
+      "Fecha de gasto": esProp ? (t.fecha_gasto || l?.fecha_gasto || "") : (l?.fecha_gasto ?? ""),
+      "Importe SAP": esProp ? t.monto : (l?.monto ?? ""), [`Importe SAP ${ml}`]: esProp ? t.monto_local : (l?.monto_local ?? ""),
+      "Impuesto SAP": esProp ? t.impuesto : (l?.impuesto ?? ""),
+      "No. comprobante": f?.numero || f?.clave || "", "Fecha comprobante": f?.fecha ?? "", "Proveedor comprobante": f?.proveedor ?? "",
+      "Moneda": f?.moneda ?? "", "Monto comprobante": esProp ? (f?.propina ?? "") : (f?.total ?? ""), "IVA comprobante": esProp ? "" : (f?.impuesto ?? ""),
+      "Archivo": f?.archivo ?? "",
+      "Diferencias": v.campos.filter(c => c.st === "warn" || c.st === "error").map(c => c.c + (c.nota ? ": " + c.nota : "")).join(" | "),
+      "Notas": v.notas.join(" | ")
+    };
+  });
+  const lim = (R.limites || []).map(x => ({ "Estado": x.st === "error" ? "Excede" : x.st === "warn" ? "No evaluable" : "Dentro del límite", "Fecha": x.fecha || "",
+    "Régimen": NOMBRE_REG[x.regimen] || x.regimen, "Concepto": x.concepto, "Región": x.region, "Comprobantes": x.etiquetas.join(" | "),
+    "Moneda": x.moneda, "Monto neto": x.monto, "Límite": x.limite, "Exceso": x.exceso > 0.01 ? x.exceso : 0, "Notas": x.notas.join(" | ") }));
+  const wb = XLSX.utils.book_new();
+  const hoja = (rows, nombre) => { const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ "Sin datos": "" }]); ws["!cols"] = Object.keys(rows[0] || { a: 1 }).map(k => ({ wch: Math.min(45, Math.max(10, k.length + 2)) })); XLSX.utils.book_append_sheet(wb, ws, nombre); };
+  hoja(filas, "Revisión"); hoja(lim, "Límites");
+  XLSX.writeFile(wb, `Revision_informe_${String(R.cab?.informe || "gastos").replace(/[^\w-]+/g, "_")}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+}
+
+/* =====================================================================
+   HISTORIAL (SUPABASE)
+   ===================================================================== */
+async function guardar(R, boton) {
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user) return toast("Tu sesión expiró. Vuelve a ingresar.");
+  const c = conteos(R);
+  boton.disabled = true; boton.textContent = "Guardando…";
+  const detalle = {
+    version: 2, cab: R.cab, monedaLocal: R.monedaLocal, paisEmpresa: R.paisEmpresa, regimen: R.regimen,
+    totalFacturas: R.totalFacturas, totalLineas: R.totalLineas, totFactLocal: R.totFactLocal, totSap: R.totSap,
+    politica: S.politica, politicaMeta: S.politicaMeta, resultados: R.resultados, limites: R.limites
+  };
+  const { error } = await sb.from(C.TABLA).insert({
+    user_id: user.id, user_email: user.email, informe_id: R.cab?.informe || null, empleado: R.cab?.empleado || null,
+    referencia: [R.cab?.informe, R.cab?.empleado, R.cab?.texto].filter(Boolean).join(" · "),
+    archivo_excel: S.excel.nombre, archivos_factura: [...new Set(S.archivos.map(a => a.origen))],
+    total_facturas: R.totalFacturas, total_lineas: R.totalLineas, coincidencias: c.ok, advertencias: c.warn, discrepancias: c.error,
+    limites_excedidos: (R.limites || []).filter(x => x.st === "error").length,
+    estado: $("#rEstado").value, comentario: $("#rComent").value.trim() || null, detalle
+  });
+  boton.disabled = false; boton.textContent = "Guardar en historial";
+  if (error) return toast("No se pudo guardar: " + error.message, 6000);
+  toast("Revisión guardada en el historial.");
+  if (confirm("Guardado. ¿Limpiar las facturas para revisar otro informe? (el Excel se mantiene cargado)")) reiniciar();
+}
+function reiniciar() {
+  S.archivos = []; S.facturas = []; S.resultados = null; S.informeId = ""; S.cab = null; S.lineas = [];
+  $("#iInforme").value = ""; $("#cabInforme").innerHTML = ""; $("#prevWrap").classList.add("oculto");
+  $("#resultados").classList.add("oculto"); $("#extraerInfo").textContent = "";
+  armarListaInformes(); dibujarArchivos(); dibujarFacturas(); actualizarBotones();
+  window.scrollTo({ top: 0, behavior: "smooth" }); $("#iInforme").focus();
+}
+async function cargarHistorial() {
+  $("#tHist").innerHTML = `<tbody><tr><td class="muted">Cargando…</td></tr></tbody>`;
+  let q = sb.from(C.TABLA).select("id,created_at,user_id,user_email,revisado_por,informe_id,empleado,referencia,archivo_excel,total_facturas,total_lineas,coincidencias,advertencias,discrepancias,limites_excedidos,estado,comentario").order("created_at", { ascending: false }).limit(200);
+  const b = $("#hBuscar").value.trim().replace(/[%,()*]/g, " ").trim();
+  if (b) q = q.or(`informe_id.ilike.%${b}%,empleado.ilike.%${b}%,referencia.ilike.%${b}%`);
+  const e = $("#hEstado").value; if (e) q = q.eq("estado", e);
+  const { data, error } = await q;
+  if (error) { $("#tHist").innerHTML = `<tbody><tr><td><div class="aviso error">${esc(error.message)}</div></td></tr></tbody>`; return; }
+  if (!data.length) { $("#tHist").innerHTML = `<tbody><tr><td class="muted">No hay revisiones guardadas.</td></tr></tbody>`; return; }
+  const chip = s => `<span class="chip ${s === "aprobado" ? "ok" : s === "rechazado" ? "error" : "warn"}">${esc(nombreEstado(s))}</span>`;
+  $("#tHist").innerHTML = `<thead><tr><th>Fecha</th><th>Informe</th><th>Colaborador</th><th>Revisó</th><th class="num">Comprob.</th><th class="num">Líneas</th><th>Resultado</th><th>Dictamen</th><th></th></tr></thead><tbody>` +
+    data.map(r => `<tr><td class="mini">${new Date(r.created_at).toLocaleString("es-CR", { dateStyle: "short", timeStyle: "short" })}</td>
+      <td><b>${esc(r.informe_id || "—")}</b>${r.comentario ? `<div class="mini muted">${esc(r.comentario)}</div>` : ""}</td>
+      <td class="mini">${esc(r.empleado || r.referencia || "")}</td><td class="mini"><b>${esc(r.revisado_por || r.user_email)}</b>${r.revisado_por && r.revisado_por !== r.user_email ? `<div class="muted">${esc(r.user_email)}</div>` : ""}</td>
+      <td class="num">${r.total_facturas}</td><td class="num">${r.total_lineas}</td>
+      <td class="mini">✅ ${r.coincidencias} · ⚠️ ${r.advertencias} · ❌ ${r.discrepancias}${r.limites_excedidos ? ` · 🔺 ${r.limites_excedidos} límite(s)` : ""}</td>
+      <td>${chip(r.estado)}</td><td><button class="btn chico" data-ver="${r.id}">Ver</button></td></tr>`).join("") + "</tbody>";
+  $$("[data-ver]").forEach(bt => bt.addEventListener("click", () => verRegistro(bt.dataset.ver)));
+}
+async function verRegistro(id) {
+  const { data, error } = await sb.from(C.TABLA).select("*").eq("id", id).single();
+  if (error) return toast(error.message);
+  const d = data.detalle || {};
+  renderResultados($("#histDetalle"), {
+    resultados: (d.resultados || []).map(x => ({ ...x, campos: x.campos || [], notas: x.notas || [],
+      linea: x.linea || (x.fila ? { numero: x.fila.numero, proveedor: x.fila.proveedor, monto: x.fila.monto, monto_local: x.fila.monto, filas: [x.fila.fila], filas_propina: [], propina: 0 } : null) })),
+    limites: d.limites || [], cab: d.cab || { informe: data.informe_id }, monedaLocal: d.monedaLocal || "",
+    totalFacturas: d.totalFacturas ?? data.total_facturas, totalLineas: d.totalLineas ?? data.total_lineas, totFactLocal: d.totFactLocal, totSap: d.totSap
+  }, { registro: data });
+  $("#histDetalle").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+async function borrarRegistro(id) {
+  if (!confirm("¿Eliminar esta revisión del historial? No se puede deshacer.")) return;
+  const { error } = await sb.from(C.TABLA).delete().eq("id", id);
+  if (error) return toast("No se pudo eliminar: " + error.message);
+  $("#histDetalle").innerHTML = ""; toast("Revisión eliminada."); cargarHistorial();
+}
+$("#hRefrescar").addEventListener("click", cargarHistorial);
+$("#hBuscar").addEventListener("keydown", e => { if (e.key === "Enter") cargarHistorial(); });
+
+/* =====================================================================
+   POLÍTICAS (editable por administradores, guardada en Supabase)
+   ===================================================================== */
+async function cargarPolitica() {
+  try {
+    const { data } = await sb.from(C.TABLA_PARAMETROS).select("valor,updated_at,updated_by").eq("clave", "politica").maybeSingle();
+    if (data?.valor) { S.politica = completarPolitica(data.valor); S.politicaMeta = { updated_at: data.updated_at, updated_by: data.updated_by }; }
+    const { data: adm } = await sb.from("administradores").select("user_id").eq("user_id", sesionUid).maybeSingle();
+    S.esAdmin = !!adm;
+  } catch (err) { console.warn("No se pudo cargar la política", err); }
+}
+let polCambiada = false;
+const marcarPol = () => { polCambiada = true; S.resultados = null; $("#polAviso").innerHTML = `<div class="aviso">Hay cambios sin guardar. Si ya comparaste un informe, vuelve a presionar "Comparar".</div>`; };
+function renderPolitica() {
+  const p = S.politica, ro = false;
+  $("#polSub").textContent = S.politicaMeta ? `Última actualización: ${new Date(S.politicaMeta.updated_at).toLocaleString("es-CR")} por ${S.politicaMeta.updated_by || "—"}` : "Usando los valores por defecto (todavía no se han guardado en Supabase)";
+  if (!polCambiada) $("#polAviso").innerHTML = `<div class="aviso info">Cualquier usuario puede modificar las políticas. Al guardar, los cambios aplican a todo el equipo y quedan registrados en el historial con tu usuario y la hora. Cada revisión guarda además una copia de la política con la que se evaluó.</div>`;
+  const gen = [
+    ["tol_monto_abs", "Tolerancia de monto (misma moneda)", "num"], ["tol_monto_pct", "Tolerancia de monto para advertencia (%)", "num"],
+    ["tol_tc_pct", "Desvío aceptado vs TC de referencia (%)", "num"], ["propina_max_pct", "Propina máxima (%)", "num"],
+    ["confianza_minima", "Confianza mínima de lectura (0-1)", "num"], ["tol_fecha_dias", "Días de diferencia aceptados vs Fecha de gasto", "num"],
+    ["desayuno_hasta", "Desayuno hasta (hora)", "time"], ["almuerzo_hasta", "Almuerzo hasta (después = cena)", "time"],
+    ["almuerzo_cena_modo", "Monto de almuerzo y cena en viajes", "sel", [["dia", "Tope diario conjunto"], ["comida", "Tope por cada comida"]]],
+    ["nacional_por_defecto", "Facturas del mismo país de la empresa", "sel", [["gira", "Gira (alimentación por día)"], ["viaticos", "Viáticos (por tiempo de comida)"]]],
+    ["por_persona", "Aplicar límite por persona cuando la factura indica varias", "bool"],
+    ["sufijos_propina", "Sufijos de propina en el ID de factura de SAP (coma; * = cualquier letra)", "lista"]
+  ];
+  $("#polGeneral").innerHTML = gen.map(([k, l, t, o]) => t === "bool"
+    ? `<label class="check"><input type="checkbox" data-g="${k}" ${p.general[k] ? "checked" : ""} ${ro ? "disabled" : ""}> ${l}</label>`
+    : `<div class="campo"><label>${l}</label>${t === "sel" ? `<select data-g="${k}" ${ro ? "disabled" : ""}>${o.map(([v, x]) => `<option value="${v}" ${p.general[k] === v ? "selected" : ""}>${x}</option>`).join("")}</select>`
+      : `<input type="${t === "time" ? "time" : "text"}" data-g="${k}" data-t="${t}" value="${esc(t === "lista" ? (p.general[k] || []).join(", ") : p.general[k])}" ${ro ? "disabled" : ""}>`}</div>`).join("");
+  $$("[data-g]").forEach(el => el.addEventListener("change", () => {
+    const k = el.dataset.g;
+    p.general[k] = el.type === "checkbox" ? el.checked : el.dataset.t === "lista" ? el.value.split(",").map(x => x.trim()).filter(Boolean)
+      : el.tagName === "SELECT" || el.type === "time" ? el.value : parseNum(el.value);
+    marcarPol();
+    if (k === "sufijos_propina" && S.informeId) seleccionarInforme(S.informeId);
+  }));
+  tablaEditable($("#polNacional"), Object.values(p.nacional), [{ k: "concepto", l: "Concepto", t: "ro" }, { k: "monto", l: "Monto", t: "num" }, { k: "moneda", l: "Moneda", t: "mon" }, { k: "incluye", l: "Incluye IVA y propina", t: "bool" }], { ro, fijo: true });
+  tablaEditable($("#polHosp"), p.viajes_hospedaje, [{ k: "region", l: "Región", t: "text" }, { k: "monto", l: "Monto por noche", t: "num" }, { k: "moneda", l: "Moneda", t: "mon" }, { k: "paises", l: "Países (separados por coma)", t: "lista" }], { ro, nuevo: () => ({ region: "", monto: 0, moneda: "USD", paises: [] }) });
+  tablaEditable($("#polAlim"), p.viajes_alimentacion, [{ k: "region", l: "Región", t: "text" }, { k: "desayuno", l: "Desayuno", t: "num" }, { k: "almuerzo_cena", l: "Almuerzo y cena", t: "num" }, { k: "moneda", l: "Moneda", t: "mon" }, { k: "paises", l: "Países (separados por coma)", t: "lista" }], { ro, nuevo: () => ({ region: "", desayuno: 0, almuerzo_cena: 0, moneda: "USD", paises: [] }) });
+  tablaEditable($("#polTc"), p.tipos_cambio, [{ k: "moneda", l: "Moneda", t: "mon" }, { k: "por_usd", l: "Unidades por 1 USD", t: "num" }], { ro, nuevo: () => ({ moneda: "", por_usd: null }) });
+  tablaEditable($("#polPaises"), p.paises, [{ k: "pais", l: "País", t: "text" }, { k: "moneda", l: "Moneda local", t: "mon" }, { k: "iva_pct", l: "IVA %", t: "num" }, { k: "iva_desglosado", l: "IVA debe venir desglosado para reclamarlo", t: "bool" }, { k: "codigos", l: "Códigos de empresa SAP (prefijos)", t: "lista" }], { ro, nuevo: () => ({ pais: "", moneda: "", iva_pct: 0, iva_desglosado: true, codigos: [] }) });
+  $("#polFechaTc").value = p.fecha_tipos_cambio || ""; $("#polFechaTc").disabled = ro;
+  $("#polFechaTc").onchange = e => { p.fecha_tipos_cambio = e.target.value.trim(); marcarPol(); };
+}
+function tablaEditable(cont, arr, cols, { ro, fijo, nuevo }) {
+  const celda = (row, c, i) => {
+    const v = row[c.k], dis = ro ? "disabled" : "";
+    if (c.t === "ro") return esc(v);
+    if (c.t === "bool") return `<input type="checkbox" data-i="${i}" data-k="${c.k}" ${v ? "checked" : ""} ${dis}>`;
+    if (c.t === "lista") return `<input type="text" data-i="${i}" data-k="${c.k}" value="${esc((v || []).join(", "))}" ${dis} style="min-width:280px">`;
+    return `<input type="text" data-i="${i}" data-k="${c.k}" value="${esc(v ?? "")}" ${dis} style="${c.t === "num" ? "width:110px;text-align:right" : c.t === "mon" ? "width:70px;text-transform:uppercase" : "min-width:140px"}">`;
+  };
+  const dibujar = () => {
+    cont.innerHTML = `<div class="scroll" style="max-height:none"><table><thead><tr>${cols.map(c => `<th>${c.l}</th>`).join("")}${fijo || ro ? "" : "<th></th>"}</tr></thead>
+      <tbody>${arr.map((row, i) => `<tr>${cols.map(c => `<td>${celda(row, c, i)}</td>`).join("")}${fijo || ro ? "" : `<td><button class="btn chico" data-del="${i}">✕</button></td>`}</tr>`).join("")}</tbody></table></div>
+      ${fijo || ro ? "" : `<button class="btn chico" data-add style="margin-top:6px">+ Agregar fila</button>`}`;
+    $$("[data-i]", cont).forEach(el => el.addEventListener("change", () => {
+      const row = arr[+el.dataset.i], c = cols.find(x => x.k === el.dataset.k);
+      row[c.k] = c.t === "num" ? parseNum(el.value) : c.t === "bool" ? el.checked : c.t === "lista" ? el.value.split(",").map(s => s.trim()).filter(Boolean) : c.t === "mon" ? el.value.trim().toUpperCase() : el.value.trim();
+      marcarPol();
+    }));
+    $$("[data-del]", cont).forEach(b => b.addEventListener("click", () => { arr.splice(+b.dataset.del, 1); dibujar(); marcarPol(); }));
+    const a = $("[data-add]", cont); if (a) a.addEventListener("click", () => { arr.push(nuevo()); dibujar(); marcarPol(); });
+  };
+  dibujar();
+}
+$("#bPolDefecto").addEventListener("click", () => {
+  if (!confirm("¿Reemplazar la política en pantalla por los valores por defecto del archivo? No se guarda hasta que presiones Guardar.")) return;
+  S.politica = clonar(C.POLITICA_DEFECTO); marcarPol(); renderPolitica();
+});
+$("#bPolGuardar").addEventListener("click", async () => {
+  const { data: { user } } = await sb.auth.getUser();
+  const ahora = new Date().toISOString();
+  const { data: guardado, error } = await sb.from(C.TABLA_PARAMETROS).upsert({ clave: "politica", valor: S.politica }).select("updated_at,updated_by").single();
+  if (error) return toast("No se pudo guardar: " + error.message, 6000);
+  S.politicaMeta = guardado || { updated_at: ahora, updated_by: user?.email };
+  polCambiada = false; toast("Políticas guardadas y registradas en el historial."); renderPolitica(); cargarHistorialPolitica();
+  if (S.cab) { S.paisEmpresa = detectarPaisEmpresa(S.cab) || S.paisEmpresa; dibujarCabecera(); }
+});
+
+/* ---------- Historial de cambios de políticas ---------- */
+function aplanar(o, pre = "", out = {}) {
+  if (Array.isArray(o) && o.some(x => x && typeof x === "object")) {
+    o.forEach((x, i) => aplanar(x, `${pre}[${x?.moneda || x?.region || x?.pais || x?.concepto || i}]`, out));
+  } else if (o && typeof o === "object" && !Array.isArray(o)) {
+    Object.entries(o).forEach(([k, v]) => aplanar(v, pre ? `${pre}.${k}` : k, out));
+  } else out[pre] = Array.isArray(o) ? o.join(", ") : o;
+  return out;
+}
+const ETIQ_POL = { general: "General", nacional: "Montos nacionales", viajes_hospedaje: "Hospedaje viajes", viajes_alimentacion: "Alimentación viajes", tipos_cambio: "Tipo de cambio", paises: "Países", fecha_tipos_cambio: "Fecha TC" };
+const bonita = ruta => ruta.replace(/^(\w+)/, m => ETIQ_POL[m] || m).replace(/\./g, " › ");
+function diferencias(a, b) {
+  const A = aplanar(a || {}), B = aplanar(b || {}), cambios = [];
+  new Set([...Object.keys(A), ...Object.keys(B)]).forEach(k => {
+    if (JSON.stringify(A[k]) !== JSON.stringify(B[k])) cambios.push({ ruta: k, antes: A[k], despues: B[k] });
+  });
+  return cambios;
+}
+async function cargarHistorialPolitica() {
+  const t = $("#tPolHist");
+  t.innerHTML = `<tbody><tr><td class="muted">Cargando…</td></tr></tbody>`;
+  const { data, error } = await sb.from("parametros_historial").select("id,cambiado_en,cambiado_por,valor_anterior,valor_nuevo").eq("clave", "politica").order("cambiado_en", { ascending: false }).limit(100);
+  if (error) { t.innerHTML = `<tbody><tr><td><div class="aviso error">${esc(error.message)}</div></td></tr></tbody>`; return; }
+  if (!data.length) { t.innerHTML = `<tbody><tr><td class="muted">Todavía no hay cambios registrados.</td></tr></tbody>`; return; }
+  const v = x => x === undefined || x === null || x === "" ? "∅" : esc(x);
+  t.innerHTML = `<thead><tr><th>Fecha</th><th>Usuario</th><th>Cambios</th></tr></thead><tbody>` + data.map(h => {
+    const cambios = h.valor_anterior ? diferencias(h.valor_anterior, h.valor_nuevo) : null;
+    const detalle = cambios === null ? "Primera versión guardada de la política"
+      : !cambios.length ? "Sin cambios de valores"
+      : cambios.slice(0, 12).map(c => `<div><b>${esc(bonita(c.ruta))}</b>: ${v(c.antes)} → ${v(c.despues)}</div>`).join("") + (cambios.length > 12 ? `<div class="muted">… y ${cambios.length - 12} cambio(s) más</div>` : "");
+    return `<tr><td class="mini" style="white-space:nowrap">${new Date(h.cambiado_en).toLocaleString("es-CR")}</td><td class="mini">${esc(h.cambiado_por)}</td><td class="mini">${detalle}</td></tr>`;
+  }).join("") + "</tbody>";
+}
+
+/* ---------- Administración de usuarios (solo admins; la operación se hace en la Edge Function) ---------- */
+const RPC_ADMIN = {
+  listar:   () => ["admin_listar_usuarios", {}],
+  clave:    d => ["admin_cambiar_clave", { p_id: d.id, p_clave: d.password }],
+  nombre:   d => ["admin_nombre", { p_id: d.id, p_nombre: d.nombre }],
+  bloquear: d => ["admin_bloquear", { p_id: d.id, p_bloquear: d.valor }],
+  admin:    d => ["admin_rol", { p_id: d.id, p_admin: d.valor }]
+};
+async function llamarAdmin(op, datos = {}) {
+  const [fn, args] = RPC_ADMIN[op](datos);
+  const { data, error } = await sb.rpc(fn, args);
+  if (error) throw new Error(/function .* does not exist|Could not find the function/i.test(error.message) ? "Faltan las funciones de administración: ejecuta el schema.sql nuevo en el SQL Editor" : error.message);
+  return op === "listar" ? { usuarios: data || [] } : data;
+}
+async function cargarUsuarios() {
+  const t = $("#tUsers");
+  t.innerHTML = `<tbody><tr><td class="muted">Cargando…</td></tr></tbody>`;
+  let lista;
+  try { lista = (await llamarAdmin("listar")).usuarios; }
+  catch (e) { t.innerHTML = `<tbody><tr><td><div class="aviso error">${esc(e.message)}</div></td></tr></tbody>`; return; }
+  const f = d => d ? new Date(d).toLocaleString("es-CR", { dateStyle: "short", timeStyle: "short" }) : "—";
+  t.innerHTML = `<thead><tr><th>Usuario</th><th>Rol</th><th>Estado</th><th>Último acceso</th><th>Acciones</th></tr></thead><tbody>` + lista.map(u => `
+    <tr data-uid="${u.id}">
+      <td><b>${esc(u.nombre || "—")}</b><div class="mini muted">${esc(u.email)}</div></td>
+      <td>${u.admin ? '<span class="chip proc">Administrador</span>' : '<span class="chip na">Revisor</span>'}</td>
+      <td>${u.bloqueado ? '<span class="chip error">Bloqueado</span>' : '<span class="chip ok">Activo</span>'}</td>
+      <td class="mini">${f(u.ultimo_acceso)}</td>
+      <td><div class="fila" style="gap:6px">
+        <button class="btn chico" data-u="clave">Cambiar contraseña</button>
+        <button class="btn chico" data-u="nombre">Editar nombre</button>
+        ${u.id === sesionUid ? '<span class="mini muted">(tú)</span>' : `
+        <button class="btn chico" data-u="admin" data-v="${u.admin ? "" : "1"}">${u.admin ? "Quitar admin" : "Hacer admin"}</button>
+        <button class="btn chico" data-u="bloquear" data-v="${u.bloqueado ? "" : "1"}">${u.bloqueado ? "Desbloquear" : "Bloquear"}</button>`}
+      </div></td></tr>`).join("") + "</tbody>";
+  $$("[data-u]", t).forEach(b => b.addEventListener("click", async () => {
+    const id = b.closest("tr").dataset.uid, u = lista.find(x => x.id === id), op = b.dataset.u;
+    const datos = { id };
+    if (op === "clave") { const c = prompt(`Nueva contraseña para ${u.email} (mínimo 8 caracteres):`); if (!c) return; if (c.length < 8) return toast("Mínimo 8 caracteres."); datos.password = c; }
+    if (op === "nombre") { const n = prompt(`Nombre para ${u.email}:`, u.nombre || ""); if (n === null) return; datos.nombre = n; }
+    if (op === "admin" || op === "bloquear") datos.valor = !!b.dataset.v;
+    b.disabled = true;
+    try { await llamarAdmin(op, datos); toast(op === "clave" ? `Contraseña de ${u.email} actualizada.` : "Cambio aplicado."); cargarUsuarios(); }
+    catch (e) { toast("Error: " + e.message, 6000); b.disabled = false; }
+  }));
+}
+$("#bRefrescarUsuarios").addEventListener("click", cargarUsuarios);
+/* Arranque */
+iniciar();
+</script>
+</body>
+</html>
