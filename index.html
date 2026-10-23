@@ -261,7 +261,11 @@ header.modbar nav button.activo{background:none;color:var(--tinta);border-bottom
   header.modbar{padding:0 10px} header.modbar .marca span{display:none}
 }
 @media (max-width:560px){.plat-marca span{display:none} .topbar{gap:6px} .topbar .usuario{gap:6px} .topbar .btn.chico{padding:4px 7px}}
-#tSug td.txt{min-width:320px;white-space:pre-wrap} #tSug select{min-width:170px}
+.t-sug td.txt{min-width:320px;line-height:1.5}
+.dictamen{margin-top:14px;padding:12px 14px;border-radius:8px;border:1px solid var(--borde);font-size:13px}
+.dictamen.ok{background:var(--ok-bg);border-color:#BFE3C9} .dictamen.warn{background:var(--warn-bg);border-color:#F2D7A6}
+.dictamen.error{background:var(--err-bg);border-color:#F3C2BE} .dictamen.info{background:#EEF1F4}
+.dictamen ul{margin:6px 0 0;padding-left:20px} .dictamen .propuesta{margin-top:10px;padding:8px 10px;background:#fff;border:1px dashed var(--borde);border-radius:6px}
 .chip.regla{background:#EEF3FF;color:#1A56C4}
 /* ---- Capacidad de IA ---- */
 .cap{--uso:#1A56C4;--pista:#E6E9EE;padding:14px 18px}
@@ -542,15 +546,28 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
 <!-- ===== SUGERENCIAS DEL EQUIPO ===== -->
 <section id="tSugerencias" class="oculto">
   <div class="tarjeta">
-    <h2>💡 Sugerencias del equipo</h2>
-    <p class="sub">Criterios que la IA aplica automáticamente en todas las revisiones siguientes, sin que nadie tenga que hacer nada más. <b>Lectura</b>: al leer cada comprobante (ej. "En los recibos de Uber el total incluye la tarifa dinámica"). <b>Revisión</b>: al presionar Comparar; cuando una aplica, aparece como "💡 Regla del equipo" en el detalle de la línea (ej. "Las propinas siempre se registran aparte"). Son compartidas por todo el equipo y queda registrado quién las creó o cambió.</p>
+    <h2>💡 Proponer una regla</h2>
+    <p class="sub">Las reglas del equipo se suman a las validaciones de la herramienta en todas las revisiones siguientes. <b>Lectura</b>: la IA las usa al leer cada comprobante. <b>Revisión</b>: al presionar Comparar; si una aplica, aparece "💡 Regla del equipo" en la línea o un aviso queda aceptado por la regla. Antes de enviarla, la IA revisa que sea clara y que no contradiga otras reglas; luego <b>un administrador la aprueba</b> (y puede ajustarla) para que empiece a aplicarse.</p>
     <div class="fila">
-      <div class="campo" style="flex:3"><label>Nueva sugerencia</label><textarea id="sugTexto" rows="2" maxlength="500" placeholder="Ej. Las propinas siempre se registran aparte; si vienen sumadas en el importe, indicarlo."></textarea></div>
-      <div class="campo" style="max-width:190px"><label>Se aplica en</label><select id="sugAlcance"><option value="ambas">Lectura y revisión</option><option value="revision">Solo revisión</option><option value="lectura">Solo lectura</option></select></div>
-      <button class="btn primario" id="bSugGuardar">Guardar sugerencia</button>
+      <div class="campo"><label>Cuándo aplica</label><input type="text" id="sugCuando" maxlength="400" placeholder="Ej. el comprobante dice SUJETO A RETENCIÓN DEFINITIVA"></div>
+      <div class="campo"><label>Qué hacer <span style="color:var(--primario)">*</span></label><input type="text" id="sugQue" maxlength="600" placeholder="Ej. aceptar el IVA reclamado aunque la factura no lo desglose"></div>
     </div>
+    <div class="fila" style="margin-top:10px">
+      <div class="campo"><label>Ejemplo (opcional)</label><input type="text" id="sugEjemplo" maxlength="300" placeholder="Ej. parqueo Reforma 10, FACTURAS 15102026 pág. 2"></div>
+      <div class="campo" style="max-width:190px"><label>Se aplica en</label><select id="sugAlcance"><option value="ambas">Lectura y revisión</option><option value="revision">Solo revisión</option><option value="lectura">Solo lectura</option></select></div>
+      <button class="btn primario" id="bSugRevisar">Revisar con IA</button>
+    </div>
+    <div id="sugDictamen"></div>
     <div id="sugAviso"></div>
-    <div class="scroll" style="max-height:520px;margin-top:14px"><table id="tSug"></table></div>
+  </div>
+  <div class="tarjeta">
+    <div class="fila" style="justify-content:space-between;align-items:center"><h2 style="margin:0">Reglas del equipo</h2><button class="btn chico" id="bSugRefrescar">Actualizar</button></div>
+    <div id="sugListas" style="margin-top:12px"></div>
+  </div>
+  <div class="tarjeta">
+    <h2>Historial de cambios de reglas</h2>
+    <p class="sub">Aprobaciones, rechazos, modificaciones y activaciones: quién, cuándo, antes y después. No se puede editar ni borrar.</p>
+    <div class="scroll" style="max-height:360px"><table id="tSugHist"></table></div>
   </div>
 </section>
 
@@ -1250,6 +1267,8 @@ function normalizarFactura(f, a, i, total) {
     no_visibles: (Array.isArray(f.campos_no_visibles) ? f.campos_no_visibles : String(f.campos_no_visibles || "").split(/[,;|]/)).map(x => String(x).trim()).filter(Boolean),
     es_fiscal: f.es_fiscal === undefined || f.es_fiscal === null ? true : esVerdadero(f.es_fiscal),
     otros_cargos: parseNum(f.otros_cargos), otros_cargos_detalle: f.otros_cargos_detalle || "",
+    leyendas: (Array.isArray(f.leyendas_fiscales) ? f.leyendas_fiscales : String(f.leyendas_fiscales || "").split(/[;|]/)).map(x => String(x).trim()).filter(Boolean),
+    reglas_equipo: (Array.isArray(f.reglas_equipo) ? f.reglas_equipo : []).map(x => String(x).trim()).filter(Boolean),
     fecha_manuscrita: esVerdadero(f.fecha_manuscrita) || /(fecha|año|dia|día)[^.]*(manuscrit|a mano)|(manuscrit|a mano)[^.]*fecha/i.test(f.observaciones || ""),
     fecha_dudosa: esVerdadero(f.fecha_dudosa) || /(fecha|año)[^.]*(parece|poco legible|ilegible|no se lee|dudos|incierto)/i.test(f.observaciones || "")
       || (Array.isArray(f.campos_no_visibles) && f.campos_no_visibles.some(x => /fecha/i.test(x))),
@@ -2260,7 +2279,22 @@ function comparar() {
   const obsR = S.obsReglas?.informe === S.cab?.informe ? S.obsReglas.porId : {};
   res.forEach(x => {
     const id = x.linea ? String(x.linea.id_gasto ?? "") : "";
-    (obsR[id] || []).forEach(o => { x.campos.push({ c: "💡 Regla del equipo", st: o.st, nota: o.nota, regla: true }); if (o.st === "warn") ajustar(x, "warn"); });
+    (obsR[id] || []).forEach(o => {
+      if (o.accion === "resolver") {
+        // la regla acepta algo que la comparación marcó: warn → ok, error → warn (nunca se borra, queda la constancia)
+        const nom = normTxt(o.campo);
+        const k = x.campos.find(c => !c.regla && (c.st === "warn" || c.st === "error") && (normTxt(c.c) === nom || normTxt(c.c).startsWith(nom) || nom.startsWith(normTxt(c.c))));
+        if (k) {
+          k.stOriginal = k.st; k.notaOriginal = k.nota || "";
+          k.st = k.st === "error" ? "warn" : "ok";
+          k.nota = `aceptado por regla del equipo${o.regla ? " " + o.regla : ""}: ${o.texto}${k.notaOriginal ? ` (antes: ${k.notaOriginal})` : ""}`;
+          k.resueltoPorRegla = true;
+          x.estado = peor([...x.campos.map(c => c.st), ...(x.ajustes || [])]);
+          return;
+        }
+      }
+      x.campos.push({ c: "💡 Regla del equipo", st: o.st, nota: o.nota, regla: true }); if (o.st === "warn") ajustar(x, "warn");
+    });
   });
   // Mismo orden que SAP: por ID de gastos; los comprobantes sin línea van al final en el orden en que se leyeron
   const ordenF = new Map(facturas.map((f, i) => [f.id, i]));
@@ -2404,7 +2438,7 @@ function renderResultados(cont, R, opts = {}) {
 function filaResultado(v, ml, editable = false) {
   const x = v.x, f = x.factura, l = x.linea, st = v.estado === "na" ? "ok" : v.estado;
   // Detalle ordenado: primero lo que está bien (en una fila) y luego cada hallazgo en su propia línea (ℹ️, ⚠️, ❌)
-  const chip = c => `<span class="chip ${c.regla && c.st === "na" ? "regla" : c.st}">${ICONO[c.st]} ${esc(c.c)}${c.nota ? ": " + esc(c.nota) : ""}</span>`;
+  const chip = c => `<span class="chip ${c.regla && c.st === "na" ? "regla" : c.st}" ${c.resueltoPorRegla ? 'title="Resuelto por una sugerencia del equipo"' : ""}>${ICONO[c.st]}${c.resueltoPorRegla ? " 💡" : ""} ${esc(c.c)}${c.nota ? ": " + esc(c.nota) : ""}</span>`;
   const visibles = v.campos.filter(c => c.st !== "na" || c.nota);
   const okChips = visibles.filter(c => c.st === "ok").map(chip).join("");
   const orden = { na: 0, warn: 1, error: 2 };
@@ -2739,59 +2773,175 @@ async function cargarBitacora() {
 const ALCANCES = { ambas: "Lectura y revisión", revision: "Solo revisión", lectura: "Solo lectura" };
 async function contarReglas() {
   let data = null, error = null;
-  try { ({ data, error } = await sb.from(C.TABLA_SUGERENCIAS).select("alcance").eq("activa", true)); }
+  try { ({ data, error } = await sb.from(C.TABLA_SUGERENCIAS).select("*").eq("activa", true)); }
   catch (e) { error = e; }   // sin conexión: la comparación sigue normal, sin las reglas de revisión
-  S.reglasRevision = error ? 0 : (data || []).filter(r => r.alcance !== "lectura").length;
-  S.reglasLectura = error ? 0 : (data || []).filter(r => r.alcance !== "revision").length;
+  const vigentes = error ? [] : (data || []).filter(r => !r.estado || r.estado === "aprobada");   // solo las aprobadas se aplican
+  S.reglasRevision = vigentes.filter(r => r.alcance !== "lectura").length;
+  S.reglasLectura = vigentes.filter(r => r.alcance !== "revision").length;
   S.sugerenciasDisponibles = !error;
 }
-async function guardarSugerencia(texto, alcance) {
-  if (!texto || texto.length < 5) { toast("Escribe la sugerencia (mínimo 5 caracteres)."); return false; }
-  const { error } = await sb.from(C.TABLA_SUGERENCIAS).insert({ texto: texto.slice(0, 500), alcance });
-  if (error) { toast(/relation|does not exist|schema cache/i.test(error.message) ? "Falta crear la tabla de sugerencias: ejecuta el schema.sql nuevo en Supabase." : "No se pudo guardar: " + error.message, 6000); return false; }
-  toast("Sugerencia guardada: se aplicará en las próximas revisiones.");
-  await contarReglas();
-  if (!$("#tSugerencias").classList.contains("oculto")) cargarSugerencias();
-  return true;
+/** La IA revisa una regla propuesta: clara, ambigua o contradice otra regla / la política */
+async function validarReglaIA(regla) {
+  for (let intento = 0; intento < 3; intento++) {
+    const r = await sb.functions.invoke(C.FUNCION_EXTRACCION, { body: { modo: "validar_regla", regla } });
+    if (!r.error) return r.data;
+    let msg = r.error.message, j = {};
+    try { j = await r.error.context.json(); msg = j.error || msg; } catch {}
+    if (r.error.context?.status === 429 && !j.diario && intento < 2) { await new Promise(res => setTimeout(res, (Math.min(60, j.esperar || 15) + 2) * 1000)); continue; }
+    return { error: msg };
+  }
 }
+const textoRegla = r => r.que_hacer ? [r.cuando ? `<b>Cuándo:</b> ${esc(r.cuando)}` : "", `<b>Qué hacer:</b> ${esc(r.que_hacer)}`, r.ejemplo ? `<span class="muted">Ejemplo: ${esc(r.ejemplo)}</span>` : ""].filter(Boolean).join("<br>") : esc(r.texto);
+const chipDictamen = d => !d ? "" : d.error ? '<span class="chip na">sin revisar por IA</span>'
+  : { clara: '<span class="chip ok">IA: clara</span>', ambigua: '<span class="chip warn">IA: ambigua</span>', contradice: '<span class="chip error">IA: contradice</span>' }[d.dictamen] || "";
+/** Panel con el dictamen de la IA y las acciones posibles */
+function pintarDictamen(cont, d, reglas, acciones) {
+  const prop = d?.propuesta, distinta = prop && (normTxt(prop.cuando) !== normTxt(acciones.actual.cuando) || normTxt(prop.que_hacer) !== normTxt(acciones.actual.que_hacer));
+  const conf = (d?.conflictos || []).map(c => { const r = reglas.find(x => x.id === c.id); return `<li><b>Regla ${c.id}</b>${r ? `: ${esc(r.texto)}` : ""} — ${esc(c.motivo)}</li>`; }).join("");
+  const tipo = d?.error ? "info" : d.dictamen === "clara" ? "ok" : d.dictamen === "ambigua" ? "warn" : "error";
+  const titulo = d?.error ? `No se pudo revisar con IA (${esc(d.error)}). Puedes enviarla igual; el administrador la revisará.`
+    : d.dictamen === "clara" ? "✅ La regla es clara." : d.dictamen === "ambigua" ? "⚠️ La regla es ambigua: conviene precisarla." : "❌ La regla contradice otra regla o la política: corrígela antes de enviarla.";
+  cont.innerHTML = `<div class="dictamen ${tipo}"><b>${titulo}</b>
+    ${(d?.problemas || []).length ? `<ul>${d.problemas.map(p => `<li>${esc(p)}</li>`).join("")}</ul>` : ""}
+    ${conf ? `<div class="mini" style="margin-top:4px">Choca con:</div><ul>${conf}</ul>` : ""}
+    ${distinta ? `<div class="propuesta"><div class="mini muted">Redacción sugerida</div>${textoRegla(prop)}</div>` : ""}
+    <div class="fila" style="gap:8px;margin-top:10px">
+      ${distinta ? '<button class="btn chico" data-d="usar">Usar redacción sugerida</button>' : ""}
+      ${acciones.botones(d)}
+    </div></div>`;
+  $$("[data-d]", cont).forEach(b => b.addEventListener("click", () => acciones[b.dataset.d](prop)));
+}
+function leerFormSug() { return { cuando: $("#sugCuando").value.trim(), que_hacer: $("#sugQue").value.trim(), ejemplo: $("#sugEjemplo").value.trim(), alcance: $("#sugAlcance").value }; }
+$("#bSugRevisar").addEventListener("click", async e => {
+  const regla = leerFormSug();
+  if (regla.que_hacer.length < 5) return toast("Escribe qué debe hacer la regla.");
+  const b = e.currentTarget; b.disabled = true; b.textContent = "Revisando…";
+  const d = await validarReglaIA(regla);
+  b.disabled = false; b.textContent = "Revisar con IA";
+  const { data: reglas } = await sb.from(C.TABLA_SUGERENCIAS).select("id,texto");
+  pintarDictamen($("#sugDictamen"), d, reglas || [], {
+    actual: regla,
+    botones: dd => dd?.dictamen === "contradice" ? (S.esAdmin ? '<button class="btn chico" data-d="enviar">Guardar de todas formas (pendiente)</button>' : "")
+      : `<button class="btn primario chico" data-d="enviar">${S.esAdmin ? "Guardar y aprobar" : "Enviar para aprobación"}</button>`,
+    usar: p => { $("#sugCuando").value = p.cuando || ""; $("#sugQue").value = p.que_hacer || ""; $("#sugEjemplo").value = p.ejemplo || ""; $("#sugDictamen").innerHTML = '<div class="aviso info">Redacción actualizada. Vuelve a presionar <b>Revisar con IA</b>.</div>'; },
+    enviar: async () => {
+      const aprobar = S.esAdmin && d?.dictamen !== "contradice";
+      const { error } = await sb.from(C.TABLA_SUGERENCIAS).insert({ ...leerFormSug(), texto: leerFormSug().que_hacer, revision_ia: d, ...(aprobar ? { estado: "aprobada" } : {}) });
+      if (error) return toast(/relation|does not exist|schema cache|column/i.test(error.message) ? "Falta ejecutar el schema.sql nuevo en Supabase." : "No se pudo guardar: " + error.message, 6000);
+      ["#sugCuando", "#sugQue", "#sugEjemplo"].forEach(s => $(s).value = ""); $("#sugDictamen").innerHTML = "";
+      toast(aprobar ? "Regla aprobada: se aplicará desde la próxima revisión." : "Regla enviada: se aplicará cuando un administrador la apruebe.");
+      await contarReglas(); cargarSugerencias();
+    },
+  });
+});
 async function cargarSugerencias() {
-  $("#tSug").innerHTML = `<tbody><tr><td class="muted">Cargando…</td></tr></tbody>`;
-  const { data, error } = await sb.from(C.TABLA_SUGERENCIAS).select("*").order("activa", { ascending: false }).order("created_at", { ascending: false });
+  const cont = $("#sugListas");
+  cont.innerHTML = `<p class="muted">Cargando…</p>`;
+  const { data, error } = await sb.from(C.TABLA_SUGERENCIAS).select("*").order("created_at", { ascending: false });
   if (error) {
-    $("#tSug").innerHTML = "";
+    cont.innerHTML = "";
     $("#sugAviso").innerHTML = `<div class="aviso error">${/relation|does not exist|schema cache/i.test(error.message) ? "Falta crear la tabla de sugerencias: ejecuta el schema.sql nuevo en el SQL Editor de Supabase." : esc(error.message)}</div>`;
     return;
   }
-  $("#sugAviso").innerHTML = "";
-  if (!data.length) { $("#tSug").innerHTML = `<tbody><tr><td class="muted">Aún no hay sugerencias. La primera que guardes se aplicará desde la siguiente revisión.</td></tr></tbody>`; return; }
+  $("#sugAviso").innerHTML = data.length && data[0].estado === undefined ? '<div class="aviso warn">Falta ejecutar el schema.sql nuevo: sin él no existe la aprobación de reglas.</div>' : "";
   const f = d => d ? new Date(d).toLocaleString("es-CR", { dateStyle: "short", timeStyle: "short" }) : "";
-  $("#tSug").innerHTML = `<thead><tr><th>Activa</th><th>Sugerencia</th><th>Se aplica en</th><th>Creada por</th><th>Último cambio</th>${S.esAdmin ? "<th></th>" : ""}</tr></thead><tbody>` +
-    data.map(r => `<tr style="${r.activa ? "" : "opacity:.55"}">
-      <td><input type="checkbox" data-sug-act="${r.id}" ${r.activa ? "checked" : ""} title="Activar o desactivar"></td>
-      <td class="txt">${esc(r.texto)}</td>
-      <td><select data-sug-alc="${r.id}">${Object.entries(ALCANCES).map(([k, v]) => `<option value="${k}" ${r.alcance === k ? "selected" : ""}>${v}</option>`).join("")}</select></td>
-      <td class="mini">${esc(r.creado_por || "")}<div class="muted">${f(r.created_at)}</div></td>
-      <td class="mini">${r.actualizado_por ? `${esc(r.actualizado_por)}<div class="muted">${f(r.updated_at)}</div>` : ""}</td>
-      ${S.esAdmin ? `<td><button class="btn chico" data-sug-del="${r.id}" title="Eliminar (solo administradores)">🗑</button></td>` : ""}</tr>`).join("") + "</tbody>";
-  const actualizar = async (id, cambios) => {
+  const pend = data.filter(r => r.estado === "pendiente"), aprob = data.filter(r => !r.estado || r.estado === "aprobada"), rech = data.filter(r => r.estado === "rechazada");
+  const fila = (r, tipo) => `<tr data-sug="${r.id}" style="${tipo === "aprobada" && !r.activa ? "opacity:.55" : ""}">
+    <td class="mini muted">${r.id}</td>
+    <td class="txt">${textoRegla(r)}${r.motivo_rechazo ? `<div class="mini" style="color:var(--err);margin-top:4px">Motivo: ${esc(r.motivo_rechazo)}</div>` : ""}</td>
+    <td class="mini">${esc(ALCANCES[r.alcance] || r.alcance)}</td>
+    <td>${chipDictamen(r.revision_ia)}</td>
+    <td class="mini">${esc(r.creado_por || "")}<div class="muted">${f(r.created_at)}</div></td>
+    <td class="mini">${r.aprobado_por ? `Aprobó: ${esc(r.aprobado_por)}<div class="muted">${f(r.aprobado_en)}</div>` : ""}${r.actualizado_por ? `<div class="muted">Último cambio: ${esc(r.actualizado_por)} · ${f(r.updated_at)}</div>` : ""}</td>
+    <td>${tipo === "aprobada" ? (r.activa ? '<span class="chip ok">Activa</span>' : '<span class="chip na">Inactiva</span>') : ""}</td>
+    ${S.esAdmin ? `<td><div class="fila" style="gap:6px">
+      ${tipo === "pendiente" ? '<button class="btn primario chico" data-s="aprobar">Aprobar</button><button class="btn chico" data-s="rechazar">Rechazar</button>' : ""}
+      ${tipo === "aprobada" ? `<button class="btn chico" data-s="activa">${r.activa ? "Desactivar" : "Activar"}</button>` : ""}
+      ${tipo === "rechazada" ? '<button class="btn chico" data-s="reabrir">Volver a pendiente</button>' : ""}
+      <button class="btn chico" data-s="editar">Editar</button><button class="btn chico" data-s="eliminar" title="Eliminar">🗑</button></div></td>` : ""}</tr>`;
+  const tabla = (lista, tipo) => `<div class="scroll" style="max-height:none"><table class="t-sug"><thead><tr><th>#</th><th>Regla</th><th>Se aplica en</th><th>Revisión IA</th><th>Propuesta por</th><th>Aprobación</th><th>Estado</th>${S.esAdmin ? "<th>Acciones</th>" : ""}</tr></thead><tbody>${lista.map(r => fila(r, tipo)).join("")}</tbody></table></div>`;
+  cont.innerHTML = (!data.length ? '<p class="muted">Aún no hay reglas. La primera que se apruebe se aplicará desde la siguiente revisión.</p>' : "")
+    + (pend.length ? `<h3>⏳ Pendientes de aprobación (${pend.length})</h3>${S.esAdmin ? "" : '<p class="sub">Un administrador las revisará; mientras tanto no se aplican.</p>'}${tabla(pend, "pendiente")}` : "")
+    + (aprob.length ? `<h3>✅ Aprobadas (${aprob.length})</h3><p class="sub">Solo las activas se aplican en las revisiones.</p>${tabla(aprob, "aprobada")}` : "")
+    + (rech.length ? `<details style="margin-top:12px"><summary>Rechazadas (${rech.length})</summary>${tabla(rech, "rechazada")}</details>` : "");
+  const actualizar = async (id, cambios, msg) => {
     const { error: e } = await sb.from(C.TABLA_SUGERENCIAS).update(cambios).eq("id", id);
-    toast(e ? "No se pudo actualizar: " + e.message : "Sugerencia actualizada."); await contarReglas(); cargarSugerencias();
+    toast(e ? "No se pudo guardar: " + e.message : msg); await contarReglas(); cargarSugerencias(); cargarHistorialSug();
   };
-  $$("[data-sug-act]").forEach(c => c.addEventListener("change", () => actualizar(c.dataset.sugAct, { activa: c.checked })));
-  $$("[data-sug-alc]").forEach(s => s.addEventListener("change", () => actualizar(s.dataset.sugAlc, { alcance: s.value })));
-  $$("[data-sug-del]").forEach(b => b.addEventListener("click", async () => {
-    if (!confirm("¿Eliminar esta sugerencia definitivamente? (Para dejar de aplicarla basta con desactivarla)")) return;
-    const { error: e } = await sb.from(C.TABLA_SUGERENCIAS).delete().eq("id", b.dataset.sugDel);
-    toast(e ? "No se pudo eliminar: " + e.message : "Sugerencia eliminada."); await contarReglas(); cargarSugerencias();
+  $$("[data-s]", cont).forEach(b => b.addEventListener("click", async () => {
+    const tr = b.closest("tr"), id = +tr.dataset.sug, r = data.find(x => x.id === id), op = b.dataset.s;
+    if (op === "aprobar") {
+      b.disabled = true; b.textContent = "Revisando…";
+      const d = await validarReglaIA({ cuando: r.cuando || "", que_hacer: r.que_hacer || r.texto, ejemplo: r.ejemplo || "", alcance: r.alcance, excluir_id: r.id });
+      if (d?.dictamen === "contradice" && !confirm(`La IA indica que esta regla contradice otras reglas o la política:\n\n- ${(d.problemas || []).join("\n- ")}\n\n¿Aprobarla de todas formas?`)) { b.disabled = false; b.textContent = "Aprobar"; return; }
+      return actualizar(id, { estado: "aprobada", activa: true, revision_ia: d?.error ? r.revision_ia : d }, "Regla aprobada: se aplicará desde la próxima revisión.");
+    }
+    if (op === "rechazar") { const m = prompt("Motivo del rechazo (lo verá quien la propuso):", ""); if (m === null) return; return actualizar(id, { estado: "rechazada", motivo_rechazo: m.trim() || null }, "Regla rechazada."); }
+    if (op === "reabrir") return actualizar(id, { estado: "pendiente", motivo_rechazo: null }, "La regla volvió a pendiente.");
+    if (op === "activa") return actualizar(id, { activa: !r.activa }, r.activa ? "Regla desactivada: deja de aplicarse." : "Regla activada.");
+    if (op === "eliminar") {
+      if (!confirm("¿Eliminar esta regla definitivamente? Para dejar de aplicarla basta con desactivarla.")) return;
+      const { error: e } = await sb.from(C.TABLA_SUGERENCIAS).delete().eq("id", id);
+      toast(e ? "No se pudo eliminar: " + e.message : "Regla eliminada."); await contarReglas(); return cargarSugerencias();
+    }
+    if (op === "editar") editarRegla(tr, r, data, actualizar);
   }));
+  cargarHistorialSug();
 }
-$("#bSugGuardar").addEventListener("click", async () => {
-  if (await guardarSugerencia($("#sugTexto").value.trim(), $("#sugAlcance").value)) $("#sugTexto").value = "";
-});
+/** Edición por un administrador: revisa con IA la nueva redacción antes de guardarla */
+function editarRegla(tr, r, todas, actualizar) {
+  const abierto = tr.nextElementSibling?.classList.contains("fila-mods");
+  $$(".fila-mods", $("#sugListas")).forEach(x => x.remove());
+  if (abierto) return;
+  const ed = document.createElement("tr"); ed.className = "fila-mods";
+  ed.innerHTML = `<td colspan="8"><div class="editor-mods">
+    <b>Editar regla ${r.id}</b>
+    <div class="fila"><div class="campo"><label>Cuándo aplica</label><input type="text" data-e="cuando" maxlength="400" value="${esc(r.cuando || "")}"></div>
+      <div class="campo"><label>Qué hacer</label><input type="text" data-e="que_hacer" maxlength="600" value="${esc(r.que_hacer || r.texto)}"></div></div>
+    <div class="fila"><div class="campo"><label>Ejemplo</label><input type="text" data-e="ejemplo" maxlength="300" value="${esc(r.ejemplo || "")}"></div>
+      <div class="campo" style="max-width:190px"><label>Se aplica en</label><select data-e="alcance">${Object.entries(ALCANCES).map(([k, v]) => `<option value="${k}" ${r.alcance === k ? "selected" : ""}>${v}</option>`).join("")}</select></div></div>
+    <div data-e-dict></div>
+    <div class="fila" style="gap:8px"><button class="btn primario chico" data-e-guardar>Revisar y guardar</button><button class="btn chico" data-e-cancelar>Cancelar</button></div></div></td>`;
+  tr.after(ed);
+  const val = () => Object.fromEntries($$("[data-e]", ed).map(i => [i.dataset.e, i.value.trim()]));
+  $("[data-e-cancelar]", ed).addEventListener("click", () => ed.remove());
+  $("[data-e-guardar]", ed).addEventListener("click", async e => {
+    const v = val(); if (v.que_hacer.length < 5) return toast("Escribe qué debe hacer la regla.");
+    const b = e.currentTarget; b.disabled = true; b.textContent = "Revisando…";
+    const d = await validarReglaIA({ ...v, excluir_id: r.id });
+    b.disabled = false; b.textContent = "Revisar y guardar";
+    const guardar = () => actualizar(r.id, { ...v, texto: v.que_hacer, revision_ia: d?.error ? r.revision_ia : d }, "Regla modificada.");
+    if (!d || d.error || d.dictamen === "clara") return guardar();
+    pintarDictamen($("[data-e-dict]", ed), d, todas, {
+      actual: v,
+      botones: () => '<button class="btn primario chico" data-d="enviar">Guardar de todas formas</button>',
+      usar: p => { $("[data-e=cuando]", ed).value = p.cuando || ""; $("[data-e=que_hacer]", ed).value = p.que_hacer || ""; $("[data-e=ejemplo]", ed).value = p.ejemplo || ""; $("[data-e-dict]", ed).innerHTML = ""; },
+      enviar: guardar,
+    });
+  });
+}
+async function cargarHistorialSug() {
+  const t = $("#tSugHist");
+  const { data, error } = await sb.from("sugerencias_historial").select("*").order("fecha", { ascending: false }).limit(100);
+  if (error) { t.innerHTML = `<tbody><tr><td class="muted">${/relation|does not exist|schema cache/i.test(error.message) ? "Disponible al ejecutar el schema.sql nuevo." : esc(error.message)}</td></tr></tbody>`; return; }
+  if (!data.length) { t.innerHTML = `<tbody><tr><td class="muted">Sin cambios todavía.</td></tr></tbody>`; return; }
+  const est = { pendiente: "pendiente", aprobada: "aprobada", rechazada: "rechazada" };
+  const desc = h => {
+    const a = h.antes || {}, d = h.despues || {}, cambios = [];
+    if (a.estado !== d.estado) cambios.push(`estado: ${est[a.estado] || a.estado} → <b>${est[d.estado] || d.estado}</b>${d.motivo_rechazo ? ` (${esc(d.motivo_rechazo)})` : ""}`);
+    if (a.activa !== d.activa) cambios.push(d.activa ? "<b>activada</b>" : "<b>desactivada</b>");
+    if (a.alcance !== d.alcance) cambios.push(`se aplica en: ${esc(ALCANCES[a.alcance] || a.alcance)} → ${esc(ALCANCES[d.alcance] || d.alcance)}`);
+    if (a.texto !== d.texto) cambios.push(`texto: <span class="muted">${esc(a.texto)}</span> → ${esc(d.texto)}`);
+    return cambios.join("<br>");
+  };
+  t.innerHTML = `<thead><tr><th>Fecha</th><th>Regla</th><th>Cambio</th><th>Hecho por</th></tr></thead><tbody>` +
+    data.map(h => `<tr><td class="mini">${new Date(h.fecha).toLocaleString("es-CR", { dateStyle: "short", timeStyle: "short" })}</td><td class="mini">#${h.sugerencia_id}</td><td class="mini">${desc(h)}</td><td class="mini">${esc(h.cambiado_por || "")}</td></tr>`).join("") + "</tbody>";
+}
+$("#bSugRefrescar").addEventListener("click", cargarSugerencias);
 /** Huella de lo que se envía a revisar: si no cambió, no se vuelve a gastar una consulta */
 function firmaRevision() {
   const R = S.resultados; if (!R) return "";
-  return R.cab?.informe + "|" + filasVista(R).map(v => `${v.x?.linea?.id_gasto}:${v.campos.filter(k => !k.regla).map(k => k.c + k.st).join(",")}`).join(";");
+  return R.cab?.informe + "|" + filasVista(R).map(v => `${v.x?.linea?.id_gasto}:${v.campos.filter(k => !k.regla).map(k => k.c + (k.stOriginal || k.st)).join(",")}`).join(";");
 }
 /** Resumen compacto de los resultados para la revisión con reglas */
 function filasParaRevision(R) {
@@ -2801,8 +2951,9 @@ function filasParaRevision(R) {
       id_gasto: String(l.id_gasto ?? ""), numero_sap: l.numero, tipo_gasto: l.tipo_gasto, proveedor_sap: l.proveedor, fecha_gasto: l.fecha_gasto,
       importe_sap: l.monto, moneda_sap: l.moneda || "", propina_sap: l.propina || 0, lineas_propina: (l.propinas || []).map(p => p.numero),
       comprobante: f ? { proveedor: f.proveedor, numero: f.numero || null, fecha: f.fecha, total: f.total, propina: f.propina, impuesto: f.impuesto, moneda: f.moneda,
-        categoria: f.categoria, tiempo_comida: f.tiempo || null, personas: f.personas, es_fiscal: f.es_fiscal, observaciones_ia: f.observaciones || "" } : null,
-      resultado: v.estado, campos: v.campos.filter(k => !k.regla).map(k => ({ campo: k.c, estado: k.st, nota: k.nota || "" })),
+        categoria: f.categoria, tiempo_comida: f.tiempo || null, personas: f.personas, es_fiscal: f.es_fiscal, tipo_documento: f.tipo_documento || "",
+        leyendas_fiscales: f.leyendas || [], reglas_equipo: f.reglas_equipo || [], observaciones_ia: f.observaciones || "" } : null,
+      resultado: v.estado, campos: v.campos.filter(k => !k.regla).map(k => ({ campo: k.c, estado: k.stOriginal || k.st, nota: k.notaOriginal ?? k.nota ?? "" })),
     };
   });
 }
@@ -2819,7 +2970,8 @@ async function aplicarReglas(manual) {
       const porId = {};
       (r.data?.observaciones || []).forEach(o => {
         const id = String(o.id_gasto ?? "").trim(); if (!id) return;
-        (porId[id] ||= []).push({ st: o.nivel === "advertencia" ? "warn" : "na", nota: `${o.nota}${o.regla ? ` (regla ${o.regla})` : ""}` });
+        (porId[id] ||= []).push({ st: o.nivel === "advertencia" ? "warn" : "na", nota: `${o.nota}${o.regla ? ` (regla ${o.regla})` : ""}`,
+          accion: o.accion === "resolver" && o.campo ? "resolver" : "agregar", campo: String(o.campo || "").trim(), regla: o.regla, texto: o.nota });
       });
       S.obsReglas = { informe: R.cab?.informe, porId, firma };
       const n = Object.values(porId).flat().length;
