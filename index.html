@@ -31,7 +31,8 @@ window.CONFIG = {
   NOMBRE_PLATAFORMA: "Agentes IA LCA",   // nombre que se ve en el login y en la barra superior
   TABLA_SUGERENCIAS: "sugerencias", // sugerencias del equipo que la IA aplica al leer y al revisar
   REGLAS_AUTOMATICAS: true,         // al comparar, aplicar automáticamente las sugerencias de revisión (1 consulta de IA) // contador compartido de cupos de IA (panel "Capacidad de IA hoy")
-  MAX_MB_ARCHIVO: 40,
+  MAX_MB_ARCHIVO: 300,              // tamaño máximo de cada archivo subido (los PDF se dividen por página)
+  MAX_MB_PAGINA: 4,                 // una página más pesada que esto se convierte a imagen JPEG antes de enviarla a la IA
   MAX_PX_IMAGEN: 2200,
 
   // Los sufijos de las líneas de propina en SAP (-P, -A…) se configuran en la pestaña Políticas
@@ -97,7 +98,7 @@ window.CONFIG = {
       tol_fecha_dias: 1,
       tol_rango_dias: 1,            // días de margen para "Fecha de inicio/fin" de SAP
       validar_periodo_informe: true, // comprobantes de todo el informe dentro del período de las estadías (solo advertencia)
-      sufijos_propina: ["*"],       // "*" = cualquier sufijo de letras (-P, -A, -S…) cuando existe la factura base; o una lista: ["P", "A"]            // días de diferencia aceptados (advertencia) entre la factura y la "Fecha de gasto" de SAP
+      sufijos_propina: ["*"],       // "*" = cualquier sufijo de letras (-P, -A, Z pegada…) cuando existe la factura base; o una lista: ["P", "A", "Z"]            // días de diferencia aceptados (advertencia) entre la factura y la "Fecha de gasto" de SAP
       desayuno_hasta: "10:59",
       almuerzo_hasta: "16:59",
       almuerzo_cena_modo: "dia",    // "dia": el monto de almuerzo y cena es un tope diario conjunto; "comida": tope por cada comida
@@ -213,6 +214,8 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .plat-marca{display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none;font-weight:700;font-size:15px;white-space:nowrap}
 .plat-marca i{width:8px;height:24px;background:var(--primario);border-radius:2px}
 .miga{color:#9AA3AD;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .miga:not(:empty)::before{content:"/";margin:0 10px 0 2px;color:#5C6570}
+.btn-reinicio{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.35);border-radius:6px;padding:5px 12px;font-weight:600;font-size:13px;cursor:pointer;white-space:nowrap;margin-left:6px}
+.btn-reinicio:hover{background:var(--primario);border-color:var(--primario)}
 .topbar .usuario{margin-left:auto;display:flex;align-items:center;gap:10px;color:#C9CDD2;font-size:13px}
 .shell{display:flex;min-height:calc(100vh - 52px)}
 .side{width:244px;flex:none;background:var(--side);color:var(--side-txt);position:sticky;top:52px;height:calc(100vh - 52px);overflow-y:auto;overflow-x:hidden;transition:width .18s ease;padding:10px 0}
@@ -254,12 +257,10 @@ header.modbar nav button.activo{background:none;color:var(--tinta);border-bottom
   body.side-abierta .side{transform:none}
   body.side-abierta .velo{display:block;position:fixed;inset:52px 0 0 0;background:rgba(0,0,0,.35);z-index:35}
   body.side-min .side{width:260px} body.side-min .side .lbl, body.side-min .side .grupo{display:initial} body.side-min .side a{justify-content:flex-start;padding:9px 16px 9px 18px;margin:1px 8px}
-  .topbar .usuario span{display:none} .miga{display:none}
+  .topbar .usuario span{display:none} .miga{display:none} .btn-reinicio{padding:5px 8px}
   header.modbar{padding:0 10px} header.modbar .marca span{display:none}
 }
 @media (max-width:560px){.plat-marca span{display:none} .topbar{gap:6px} .topbar .usuario{gap:6px} .topbar .btn.chico{padding:4px 7px}}
-.sug-panel{margin-top:14px;padding:12px 14px;border:1px dashed var(--borde);border-radius:8px;background:#FBFCFD}
-.sug-panel .fila b{font-size:13px}
 #tSug td.txt{min-width:320px;white-space:pre-wrap} #tSug select{min-width:170px}
 .chip.regla{background:#EEF3FF;color:#1A56C4}
 /* ---- Capacidad de IA ---- */
@@ -360,6 +361,7 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
   <button class="hamb" id="bMenu" title="Mostrar u ocultar el menú" aria-label="Menú"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
   <a class="plat-marca" href="#/inicio"><i></i><span id="platNombre">Agentes IA LCA</span></a>
   <span class="miga" id="miga"></span>
+  <button class="btn-reinicio oculto" id="bReiniciarTodo" title="Borra el Excel, los comprobantes, el estado de cuenta y los resultados para empezar de cero">↺ Reiniciar todo</button>
   <div class="usuario"><span id="uEmail"></span><button class="btn chico" id="bMiClave" title="Cambiar mi contraseña">Mi contraseña</button><button class="btn chico" id="bSalir">Salir</button></div>
 </div>
 <div class="shell">
@@ -541,7 +543,7 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
 <section id="tSugerencias" class="oculto">
   <div class="tarjeta">
     <h2>💡 Sugerencias del equipo</h2>
-    <p class="sub">Criterios que la IA aplica en las siguientes revisiones. <b>Lectura</b>: al leer los comprobantes (ej. "En los recibos de Uber el total incluye la tarifa dinámica"). <b>Revisión</b>: al revisar los resultados ya comparados; aparecen como "💡 Regla del equipo" en el detalle (ej. "Las propinas siempre se registran aparte con sufijo -P"). Son compartidas por todo el equipo y queda registrado quién las creó o cambió.</p>
+    <p class="sub">Criterios que la IA aplica automáticamente en todas las revisiones siguientes, sin que nadie tenga que hacer nada más. <b>Lectura</b>: al leer cada comprobante (ej. "En los recibos de Uber el total incluye la tarifa dinámica"). <b>Revisión</b>: al presionar Comparar; cuando una aplica, aparece como "💡 Regla del equipo" en el detalle de la línea (ej. "Las propinas siempre se registran aparte"). Son compartidas por todo el equipo y queda registrado quién las creó o cambió.</p>
     <div class="fila">
       <div class="campo" style="flex:3"><label>Nueva sugerencia</label><textarea id="sugTexto" rows="2" maxlength="500" placeholder="Ej. Las propinas siempre se registran aparte; si vienen sumadas en el importe, indicarlo."></textarea></div>
       <div class="campo" style="max-width:190px"><label>Se aplica en</label><select id="sugAlcance"><option value="ambas">Lectura y revisión</option><option value="revision">Solo revisión</option><option value="lectura">Solo lectura</option></select></div>
@@ -1005,10 +1007,11 @@ const ordenGasto = (a, b) => numGasto(a.id_gasto) - numGasto(b.id_gasto) || Stri
 const idsLinea = l => l ? [l.solo_propina ? null : l.id_gasto, ...(l.ids_propina || []).map(x => x + " (P)")].filter(x => x !== null && x !== "").join(", ") : "";
 /** Agrupa las filas "-P" (propina) con su factura base */
 function regexPropina() {
+  // El sufijo puede ir separado ("1234-P", "1234 A", "1234_Z") o pegado a un número ("#1-37248Z", "100001010000000127Z")
   const lista = (G().sufijos_propina || ["P"]).map(x => String(x).trim()).filter(Boolean);
-  if (lista.includes("*")) return /^(.*?)[\s_-]+([A-Za-z]{1,6})$/;   // "*" = cualquier sufijo de letras
+  if (lista.includes("*")) return /^(.*?)(?:[\s_-]+|(?<=\d))([A-Za-z]{1,6})$/;   // "*" = cualquier sufijo de letras
   const suf = lista.map(x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  return new RegExp(`^(.*?)[\\s_-]+(${suf.join("|") || "P"})$`, "i");
+  return new RegExp(`^(.*?)(?:[\\s_-]+|(?<=\\d))(${suf.join("|") || "P"})$`, "i");
 }
 function agruparLineas(filas) {
   const re = regexPropina();
@@ -1017,8 +1020,9 @@ function agruparLineas(filas) {
     impuesto: r.impuesto, codigo_impuesto: r.codigo_impuesto, propina: 0, propina_local: 0, propina_imp: 0, solo_propina: false,
     id_gasto: r.id_gasto, ids_propina: [], propinas: [], fecha_gasto: r.fecha_gasto, finalidad: r.finalidad,
     tipo_gasto: r.tipo_gasto, categoria_gasto: r.categoria_gasto, moneda: r.moneda, fecha_inicio: r.fecha_inicio, fecha_fin: r.fecha_fin, salida: r.salida, llegada: r.llegada });
-  const bases = new Set(filas.filter(r => !re.test(r.numero)).map(r => alfanum(r.numero)));
-  const esPropina = r => re.test(r.numero) && bases.has(alfanum(r.numero.match(re)[1].trim()));
+  const bases = new Set(filas.map(r => alfanum(r.numero)).filter(Boolean));
+  // es propina si al quitarle el sufijo de letras queda el número de otra línea del mismo informe
+  const esPropina = r => { const m = re.exec(r.numero || ""); const b = m && alfanum(m[1].trim()); return !!b && b !== alfanum(r.numero) && bases.has(b); };
   filas.filter(r => !esPropina(r)).forEach(r => {
     const l = nueva(r, r.numero); lineas.push(l);
     const k = alfanum(r.numero); if (k && !porNum.has(k)) porNum.set(k, l);
@@ -1074,6 +1078,7 @@ async function agregarArchivos(files) {
     if (S.archivos.some(a => a.origen === file.name && a.tamOrigen === file.size)) continue;
     const esPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
     if (esPdf && C.DIVIDIR_PDF_POR_PAGINA && window.PDFLib) {
+      $("#extraerInfo").textContent = `Preparando ${file.name} (${(file.size / 1048576).toFixed(1)} MB)…`;
       try {
         const src = await PDFLib.PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
         const n = src.getPageCount();
@@ -1082,9 +1087,19 @@ async function agregarArchivos(files) {
           const [pg] = await doc.copyPages(src, [i]); doc.addPage(pg);
           const bytes = await doc.save();
           S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, pagina: i + 1, nombre: n > 1 ? `${file.name} · pág. ${i + 1} de ${n}` : file.name, tipo: "application/pdf", bytes, size: bytes.length, estado: "pendiente", error: "", n: 0 });
+          if (n > 5) { $("#extraerInfo").textContent = `Preparando ${file.name}: página ${i + 1} de ${n}…`; await new Promise(r => setTimeout(r, 0)); }
         }
+        $("#extraerInfo").textContent = "";
         continue;
-      } catch (err) { console.warn("No se pudo dividir el PDF, se envía completo", err); }
+      } catch (err) { console.warn("pdf-lib no pudo dividir el PDF; se intenta página por página con pdf.js", err); }
+      // Respaldo: PDF que pdf-lib no puede abrir (dañado, protegido): cada página se convierte a imagen al enviarla
+      try {
+        const pdf = await abrirPdfJs(file);
+        for (let p = 1; p <= pdf.numPages; p++)
+          S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, pagina: p, nombre: pdf.numPages > 1 ? `${file.name} · pág. ${p} de ${pdf.numPages}` : file.name, tipo: "image/jpeg", fuentePdf: file, size: Math.round(file.size / pdf.numPages), estado: "pendiente", error: "", n: 0 });
+        $("#extraerInfo").textContent = "";
+        continue;
+      } catch (err) { console.warn("pdf.js tampoco pudo abrir el PDF; se envía completo", err); $("#extraerInfo").textContent = ""; }
     }
     S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, nombre: file.name, tipo: esPdf ? "application/pdf" : file.type, file, size: file.size, estado: "pendiente", error: "", n: 0 });
   }
@@ -1122,9 +1137,43 @@ function dibujarArchivos() {
   }));
 }
 function leerBase64(file) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = rej; r.readAsDataURL(file); }); }
+/** PDF abiertos con pdf.js (se reutilizan entre páginas del mismo archivo) */
+const pdfJsCache = new Map();
+function abrirPdfJs(fuente) {
+  if (!window.pdfjsLib) return Promise.reject(new Error("No se cargó el lector de PDF (pdf.js)"));
+  pdfjsLib.GlobalWorkerOptions.workerSrc ||= "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  if (!pdfJsCache.has(fuente)) {
+    const p = (fuente instanceof Uint8Array ? Promise.resolve(fuente.slice()) : fuente.arrayBuffer().then(b => new Uint8Array(b)))
+      .then(data => pdfjsLib.getDocument({ data }).promise);
+    p.catch(() => pdfJsCache.delete(fuente));
+    pdfJsCache.set(fuente, p);
+  }
+  return pdfJsCache.get(fuente);
+}
+/** Convierte una página de PDF en JPEG (lado mayor = MAX_PX_IMAGEN) para no enviar páginas de varios MB */
+async function paginaPdfAJpeg(fuente, numero) {
+  const pdf = await abrirPdfJs(fuente);
+  const page = await pdf.getPage(numero), v1 = page.getViewport({ scale: 1 });
+  const vp = page.getViewport({ scale: Math.min(4, C.MAX_PX_IMAGEN / Math.max(v1.width, v1.height)) });
+  const blob = await renderizarImagen(async ctx => { await page.render({ canvasContext: ctx, viewport: vp }).promise; }, vp.width, vp.height);
+  page.cleanup();
+  return { tipo: "image/jpeg", datos: await leerBase64(blob) };
+}
 async function prepararArchivo(a) {
-  if (a.bytes) return { tipo: "application/pdf", datos: u8ToB64(a.bytes) };
-  if (a.tipo === "application/pdf") return { tipo: "application/pdf", datos: await leerBase64(a.file) };
+  if (a.fuentePdf) return paginaPdfAJpeg(a.fuentePdf, a.pagina);
+  if (a.bytes) {
+    if (a.bytes.length > C.MAX_MB_PAGINA * 1048576) {
+      const img = await paginaPdfAJpeg(a.bytes, 1);
+      pdfJsCache.delete(a.bytes);
+      return img;
+    }
+    return { tipo: "application/pdf", datos: u8ToB64(a.bytes) };
+  }
+  if (a.tipo === "application/pdf") {
+    // PDF que ni pdf-lib ni pdf.js pudieron abrir: se envía completo solo si es liviano
+    if (a.file.size > 12 * 1048576) throw new Error(`El PDF pesa ${(a.file.size / 1048576).toFixed(0)} MB y no se pudo dividir por páginas. Ábrelo y guárdalo de nuevo como PDF (Imprimir → Guardar como PDF) e intenta otra vez.`);
+    return { tipo: "application/pdf", datos: await leerBase64(a.file) };
+  }
   const bmp = await createImageBitmap(a.file);
   const k = Math.min(1, C.MAX_PX_IMAGEN / Math.max(bmp.width, bmp.height));
   const cv = document.createElement("canvas"); cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
@@ -1755,7 +1804,7 @@ function evaluarPar(f, l, num) {
     let notaP = sim < 0.8 ? `similitud ${Math.round(sim * 100)} %` : "";
     // Si número y monto coinciden, un nombre distinto suele ser el nombre comercial: advertir, no rechazar
     const montoCoincide = compararImporte(f.total, f.moneda, l, "monto").st === "ok";
-    if (stP === "error" && (num === "exacto" || num === "parcial") && montoCoincide) {
+    if (stP === "error" && (num === "exacto" || num === "parcial" || num === "alterno") && montoCoincide) {
       stP = "warn";
       notaP = `la razón social de SAP ("${l.proveedor}") no aparece en la lectura ("${[f.proveedor, f.nombre_comercial].filter(Boolean).join(" / ")}"), pero número y monto coinciden; verificar`;
     }
@@ -2098,6 +2147,47 @@ function emparejarMovimientos(res, movs) {
   }
   return lista;
 }
+/**
+ * Une como propina las líneas de SAP sin comprobante cuyo importe coincide con la propina de un comprobante emparejado
+ * que todavía no tiene propina registrada. Exige misma fecha de gasto (± tolerancia); el mismo proveedor en SAP suma.
+ * Devuelve el conjunto de líneas absorbidas (ya no se muestran como "sin comprobante").
+ */
+function propinasPorMonto(res) {
+  const absorbidas = new Set(), tolF = G().tol_fecha_dias ?? 1;
+  const sueltas = res.filter(x => x.tipo === "linea_sola" && !x.linea.solo_propina && !(x.linea.propinas || []).length);
+  const pares = res.filter(x => x.tipo === "par" && x.factura?.propina > 0 && !(x.linea.propina > 0));
+  const cand = [];
+  sueltas.forEach(s => pares.forEach(p => {
+    const l = s.linea, f = p.factura;
+    if (compararImporte(f.propina, f.moneda, l, "monto").st !== "ok") return;
+    const fechaRef = p.linea.fecha_gasto || f.fecha;
+    const d = l.fecha_gasto && fechaRef ? Math.abs(difDiasFirmado(l.fecha_gasto, fechaRef)) : null;
+    if (d !== null && d > tolF) return;
+    let s2 = 10 + (d === 0 ? 5 : 0);
+    s2 += 5 * ((simNombre(l.proveedor || "", p.linea.proveedor || "") ?? 0));
+    if (alfanum(l.numero).startsWith(alfanum(p.linea.numero).slice(0, 6))) s2 += 3;   // número parecido al de la factura
+    cand.push({ s, p, sc: s2 });
+  }));
+  cand.sort((a, b) => b.sc - a.sc);
+  const usadosS = new Set(), usadosP = new Set();
+  for (const { s, p } of cand) {
+    if (usadosS.has(s) || usadosP.has(p)) continue;
+    usadosS.add(s); usadosP.add(p);
+    const t = s.linea, base = p.linea;
+    // copia de la línea base con la propina agregada (no se modifica S.lineas)
+    const nueva = { ...base, propinas: [...(base.propinas || []), { id_gasto: t.id_gasto, fila: t.filas?.[0], numero: t.numero, monto: t.monto, monto_local: t.monto_local, impuesto: t.impuesto,
+      codigo_impuesto: t.codigo_impuesto, fecha_gasto: t.fecha_gasto, tipo_gasto: t.tipo_gasto, moneda: t.moneda, porMonto: true }],
+      filas_propina: [...(base.filas_propina || []), ...(t.filas || [])], ids_propina: [...(base.ids_propina || []), `${t.id_gasto} (por monto)`],
+      propina: (base.propina || 0) + (t.monto || 0), propina_local: (base.propina_local || 0) + ((t.monto_local ?? t.monto) || 0), propina_imp: (base.propina_imp || 0) + (t.impuesto || 0) };
+    const { campos, notas } = evaluarPar(p.factura, nueva, matchNumero(p.factura, nueva.numero));
+    campos.push({ c: "Propina por monto", st: "na", nota: `la línea ${t.id_gasto} (${t.numero}) no tiene comprobante propio y su importe (${mm(t.moneda || S.monedaLocal, t.monto)}) es la propina de esta factura, del mismo día: se toma como su línea de propina` });
+    p.linea = nueva; p.campos = campos; p.notas = notas;
+    p.estado = peor([...campos.map(c => c.st), ...(p.ajustes || [])]);
+    absorbidas.add(t);
+    res.splice(res.indexOf(s), 1);
+  }
+  return absorbidas;
+}
 function comparar() {
   const lineas = S.lineas, facturas = marcarFragmentos(S.facturas);
   facturas.forEach(f => { delete f._tipoGasto; delete f._nochesSap; delete f._fechaLinea; });
@@ -2120,14 +2210,18 @@ function comparar() {
     .concat(f.visibilidad !== "completa" ? [`Comprobante no 100 % visible${f.no_visibles?.length ? " (no se ve: " + f.no_visibles.join(", ") + ")" : ""}: puede que no se haya podido emparejar por eso; corrige los datos en la tabla y vuelve a comparar.`] : [])
     .concat(f.observaciones ? ["IA: " + f.observaciones] : []) }); });
   lineas.forEach((l, j) => { if (!usadasL.has(j)) res.push({ tipo: "linea_sola", estado: "error", factura: null, linea: l, campos: [], notas: [l.solo_propina ? "Propina registrada en SAP sin la factura base ni comprobante." : "Línea de SAP sin comprobante de respaldo."] }); });
+  // Propinas identificadas por MONTO: una línea suelta cuyo importe es la propina de un comprobante ya emparejado
+  // (SAP no deja repetir el ID de factura, así que la propina puede venir con cualquier número o sufijo)
+  const absorbidas = propinasPorMonto(res);
   // Duplicados
   const claveF = f => f.numero ? alfanum(f.proveedor).slice(0, 6) + "|" + soloDigitos(f.numero) : null;
   const cuenta = (lista, key) => { const c = {}; lista.forEach(x => { const k = key(x); if (k) c[k] = (c[k] || 0) + 1; }); return c; };
-  const dupF = cuenta(facturas, claveF), dupL = cuenta(lineas, l => soloDigitos(l.numero) || null);
+  const claveL = l => l.solo_propina ? null : (alfanum(l.numero) || null);
+  const dupF = cuenta(facturas, claveF), dupL = cuenta(lineas.filter(l => !absorbidas.has(l)), claveL);
   res.forEach(x => {
     const kf = x.factura && claveF(x.factura);
     if (kf && dupF[kf] > 1) { x.campos.push({ c: "Duplicado", st: "warn", nota: "el mismo número de comprobante aparece más de una vez en los archivos" }); ajustar(x, "warn"); }
-    const kl = x.linea && soloDigitos(x.linea.numero);
+    const kl = x.linea && claveL(x.linea);
     if (kl && dupL[kl] > 1) { x.campos.push({ c: "Duplicado", st: "error", nota: "ID de factura repetido en el informe de SAP" }); ajustar(x, "error"); }
   });
   // Período del informe: comprobantes dentro del rango de estadías declarado en SAP (solo advertencia)
@@ -2190,7 +2284,7 @@ $("#bComparar").addEventListener("click", () => {
   renderResultados($("#resultados"), S.resultados, { editable: true });
   $("#resultados").classList.remove("oculto");
   $("#resultados").scrollIntoView({ behavior: "smooth", block: "start" });
-  if (C.REGLAS_AUTOMATICAS && S.reglasRevision > 0 && S.obsReglas?.firma !== firmaRevision()) aplicarReglas(false);
+  if (C.REGLAS_AUTOMATICAS && S.obsReglas?.firma !== firmaRevision()) contarReglas().then(() => { if (S.reglasRevision > 0) aplicarReglas(false); });
 });
 
 /* =====================================================================
@@ -2269,17 +2363,7 @@ function renderResultados(cont, R, opts = {}) {
         <select id="rEstado"><option value="aprobado">Aprobado</option><option value="con_observaciones">Con observaciones</option><option value="rechazado">Rechazado</option></select></div>
       <div class="campo"><label>Comentario</label><input type="text" id="rComent" value="${esc(ui.comentario || "")}" placeholder="Opcional: observaciones para el colaborador o contabilidad"></div>
       <button class="btn primario" data-acc="guardar">Guardar en historial</button>
-      <button class="btn" data-acc="nueva" title="Borra el Excel, los comprobantes y los resultados para empezar otra revisión">↺ Nueva revisión</button></div>
-    <div class="sug-panel">
-      <div class="fila" style="align-items:center">
-        <b>💡 Reglas del equipo</b><span class="mini muted" id="reglasEstado">${esc(S.reglasEstado || "")}</span>
-        <button class="btn chico" data-acc="reglas">Aplicar reglas del equipo (IA)</button>
-      </div>
-      <div class="fila" style="margin-top:8px">
-        <div class="campo" style="flex:3"><input type="text" id="rSug" maxlength="500" placeholder="¿Algo que la herramienta debería considerar la próxima vez? Ej. las propinas siempre se registran aparte"></div>
-        <div class="campo" style="max-width:180px"><select id="rSugAlc"><option value="ambas">Lectura y revisión</option><option value="revision">Solo revisión</option><option value="lectura">Solo lectura</option></select></div>
-        <button class="btn" data-acc="sugerir">Guardar sugerencia</button>
-      </div></div>` : ""}
+      <button class="btn" data-acc="nueva" title="Borra el Excel, los comprobantes y los resultados para empezar otra revisión">↺ Nueva revisión</button></div>` : ""}
   </div>`;
   if (editable) {
     $("#rEstado", cont).value = ui.dictamen || (c.error || exc ? "rechazado" : c.warn ? "con_observaciones" : "aprobado");
@@ -2314,15 +2398,7 @@ function renderResultados(cont, R, opts = {}) {
   $$("[data-restaurar]", cont).forEach(b => b.addEventListener("click", () => { delete R.eliminadas[b.dataset.restaurar]; ui.verEliminadas = true; redibujar(); }));
   $("[data-acc=excel]", cont).addEventListener("click", () => exportarExcel(R));
   const bg = $("[data-acc=guardar]", cont); if (bg) bg.addEventListener("click", () => guardar(R, bg));
-  const br = $("[data-acc=reglas]", cont); if (br) br.addEventListener("click", () => aplicarReglas(true));
-  const bs = $("[data-acc=sugerir]", cont); if (bs) bs.addEventListener("click", async () => {
-    const txt = $("#rSug", cont).value.trim();
-    if (await guardarSugerencia(txt, $("#rSugAlc", cont).value)) $("#rSug", cont).value = "";
-  });
-  const bn = $("[data-acc=nueva]", cont); if (bn) bn.addEventListener("click", () => {
-    if (!S.guardado && !confirm("Esta revisión no se ha guardado en el historial. ¿Empezar una nueva de todas formas? Se borrarán el Excel, los comprobantes y los resultados.")) return;
-    nuevaRevision();
-  });
+  const bn = $("[data-acc=nueva]", cont); if (bn) bn.addEventListener("click", reiniciarTodo);
   const bb = $("[data-acc=borrar]", cont); if (bb) bb.addEventListener("click", () => borrarRegistro(registro.id));
 }
 function filaResultado(v, ml, editable = false) {
@@ -2499,6 +2575,7 @@ function navegar() {
   $$("#sideNav a").forEach(a => a.classList.toggle("activo", a.dataset.ruta === ruta));
   const titulo = ruta === "inicio" ? "" : ruta === "admin" ? "Administración" : (mod?.nombre || "");
   $("#miga").textContent = titulo;
+  $("#bReiniciarTodo").classList.toggle("oculto", ruta !== MOD_REVISOR);
   document.title = (titulo ? titulo + " · " : "") + C.NOMBRE_PLATAFORMA;
   if (ruta === "admin") abrirAdmin(PL.adminTab || "usuarios");
   MODULOS_APP[ruta]?.alAbrir?.();
@@ -2511,6 +2588,7 @@ $("#bMenu").addEventListener("click", () => {
   else { document.body.classList.toggle("side-min"); try { localStorage.setItem("plat-side-min", document.body.classList.contains("side-min") ? "1" : ""); } catch {} }
 });
 $("#velo").addEventListener("click", () => document.body.classList.remove("side-abierta"));
+$("#bReiniciarTodo").addEventListener("click", reiniciarTodo);
 try { if (localStorage.getItem("plat-side-min")) document.body.classList.add("side-min"); } catch {}
 $("#platNombre").textContent = C.NOMBRE_PLATAFORMA; $("#loginNombre").textContent = C.NOMBRE_PLATAFORMA; document.title = C.NOMBRE_PLATAFORMA;
 
@@ -2660,7 +2738,9 @@ async function cargarBitacora() {
    ===================================================================== */
 const ALCANCES = { ambas: "Lectura y revisión", revision: "Solo revisión", lectura: "Solo lectura" };
 async function contarReglas() {
-  const { data, error } = await sb.from(C.TABLA_SUGERENCIAS).select("alcance").eq("activa", true);
+  let data = null, error = null;
+  try { ({ data, error } = await sb.from(C.TABLA_SUGERENCIAS).select("alcance").eq("activa", true)); }
+  catch (e) { error = e; }   // sin conexión: la comparación sigue normal, sin las reglas de revisión
   S.reglasRevision = error ? 0 : (data || []).filter(r => r.alcance !== "lectura").length;
   S.reglasLectura = error ? 0 : (data || []).filter(r => r.alcance !== "revision").length;
   S.sugerenciasDisponibles = !error;
@@ -2728,9 +2808,9 @@ function filasParaRevision(R) {
 }
 async function aplicarReglas(manual) {
   const R = S.resultados; if (!R) return;
-  const estado = msg => { S.reglasEstado = msg; const e = $("#reglasEstado"); if (e) e.textContent = msg; };
+  const estado = msg => { S.reglasEstado = msg; console.info("Reglas del equipo:", msg); };
   if (S.reglasRevision === undefined) await contarReglas();
-  if (!S.reglasRevision) { estado(S.sugerenciasDisponibles === false ? "falta crear la tabla de sugerencias (schema.sql)" : "no hay sugerencias activas para la revisión"); if (manual) toast("No hay sugerencias activas para la revisión. Agrégalas abajo o en la pestaña Sugerencias."); return; }
+  if (!S.reglasRevision) { estado(S.sugerenciasDisponibles === false ? "falta crear la tabla de sugerencias (schema.sql)" : "no hay sugerencias activas para la revisión"); if (manual) toast("No hay sugerencias activas para la revisión. Agrégalas en la pestaña Sugerencias."); return; }
   const firma = firmaRevision();
   estado("aplicando reglas del equipo…");
   for (let intento = 0; ; intento++) {
@@ -2749,6 +2829,7 @@ async function aplicarReglas(manual) {
       S.resultados.manual = previo.manual || {}; S.resultados.eliminadas = previo.eliminadas || {}; S.resultados._ui = previo._ui;
       S.obsReglas.firma = firmaRevision();
       estado(`${r.data?.reglas || 0} regla(s) aplicada(s) · ${n} observación(es)${r.data?.modelo ? " · " + r.data.modelo : ""}`);
+      if (n) toast(`💡 Sugerencias del equipo: ${n} observación(es) agregada(s) al detalle.`);
       renderResultados($("#resultados"), S.resultados, { editable: true });
       cargarCapacidad();
       return;
@@ -2766,6 +2847,14 @@ async function aplicarReglas(manual) {
   }
 }
 
+/** Botón "Reiniciar todo" (barra superior) y "Nueva revisión": pide confirmación si hay trabajo sin guardar */
+function reiniciarTodo() {
+  const hayTrabajo = S.excel.wb || S.archivos.length || S.resultados;
+  if (hayTrabajo && !S.guardado && !confirm("¿Reiniciar todo? Se borrarán el Excel, el número de informe, los comprobantes leídos, el estado de cuenta y los resultados. Esta revisión no se ha guardado en el historial.")) return;
+  nuevaRevision();
+  $("#mRevisor header nav button[data-tab='nueva']")?.click();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
 /** Empieza de cero: Excel, informe, comprobantes, estado de cuenta y resultados */
 function nuevaRevision() {
   reiniciar();
