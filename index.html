@@ -1090,12 +1090,14 @@ prepararZona($("#zFact"), $("#fFact"), agregarArchivos);
 async function agregarArchivos(files) {
   if (C.MODO_LECTURA === "copilot") return agregarArchivosCopilot(files);
   calentarFuncion();
+  const huellas = new Map();
   const validos = files.filter(f => /pdf|jpe?g|png|webp/i.test(f.type) || /\.(pdf|jpe?g|png|webp)$/i.test(f.name));
   if (validos.length < files.length) toast("Algunos archivos se omitieron (solo PDF, JPG, PNG o WEBP). Las fotos HEIC de iPhone deben convertirse a JPG.", 6000);
   for (const file of validos) {
     if (file.size > C.MAX_MB_ARCHIVO * 1048576) { toast(`${file.name} supera ${C.MAX_MB_ARCHIVO} MB`); continue; }
     if (S.archivos.some(a => a.origen === file.name && a.tamOrigen === file.size)) continue;
     const esPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+    huellas.set(file.name + "|" + file.size, await huella(await file.arrayBuffer()));   // para reutilizar lecturas del mismo archivo
     if (esPdf && C.DIVIDIR_PDF_POR_PAGINA && window.PDFLib) {
       $("#extraerInfo").textContent = `Preparando ${file.name} (${(file.size / 1048576).toFixed(1)} MB)…`;
       try {
@@ -1122,17 +1124,19 @@ async function agregarArchivos(files) {
     }
     S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, nombre: file.name, tipo: esPdf ? "application/pdf" : file.type, file, size: file.size, estado: "pendiente", error: "", n: 0 });
   }
+  S.archivos.forEach(a => { if (!a.huellaOrigen) a.huellaOrigen = huellas.get(a.origen + "|" + a.tamOrigen) || null; });
   dibujarArchivos(); actualizarBotones();
 }
 function dibujarArchivos() {
   if (C.MODO_LECTURA === "copilot") return dibujarArchivosCopilot();
   const et = a => ({ pendiente: '<span class="chip na">Pendiente</span>', proc: '<span class="chip proc">Leyendo…</span>',
-    ok: a.continuacion && !a.n && !a.nMov ? '<span class="chip na">Continuación de la página anterior</span>' : `${a.n || !a.nMov ? `<span class="chip ${a.esperados && a.n !== a.esperados ? "warn" : "ok"}">✓ ${a.n}${a.esperados ? " de " + a.esperados : ""} comprobante${a.n === 1 ? "" : "s"}</span>` : ""}${a.nMov ? ` <span class="chip proc">💳 ${a.nMov} movimiento${a.nMov === 1 ? "" : "s"}</span>` : ""}`, error: '<span class="chip error">Error</span>' }[a.estado]);
+    ok: a.enBlanco ? '<span class="chip na" title="No se envió a la IA">Página en blanco · no se leyó</span>' : a.continuacion && !a.n && !a.nMov ? '<span class="chip na">Continuación de la página anterior</span>' : `${a.n || !a.nMov ? `<span class="chip ${a.esperados && a.n !== a.esperados ? "warn" : "ok"}">✓ ${a.n}${a.esperados ? " de " + a.esperados : ""} comprobante${a.n === 1 ? "" : "s"}</span>` : ""}${a.nMov ? ` <span class="chip proc">💳 ${a.nMov} movimiento${a.nMov === 1 ? "" : "s"}</span>` : ""}`, error: '<span class="chip error">Error</span>' }[a.estado]);
   $("#listaArch").innerHTML = S.archivos.map(a => `<div class="archivo">
       <span class="n" title="${esc(a.nombre)}">${esc(a.nombre)} <span class="muted mini">(${(a.size / 1024).toFixed(0)} KB${a.modelo ? " · " + esc(a.modelo.replace(/^gemini-/, "")) : ""})</span></span>
       ${a.error ? `<span class="err">${esc(a.error)}</span>` : ""}${et(a)}
       ${a.estado === "error" ? `<button class="btn chico" data-reintentar="${a.id}">Reintentar</button>` : ""}
-      ${a.estado === "ok" ? `<button class="btn chico" data-releer="${a.id}" title="Volver a leer con IA indicando cuántos comprobantes hay">Releer</button>` : ""}
+      ${a.estado === "ok" && a.enBlanco ? `<button class="btn chico" data-leerigual="${a.id}" title="Enviar la página a la IA aunque parezca en blanco">Leer igual</button>` : ""}
+      ${a.estado === "ok" && !a.enBlanco ? `<button class="btn chico" data-releer="${a.id}" title="Volver a leer con IA indicando cuántos comprobantes hay">Releer</button>` : ""}
       ${a.estado === "ok" && a.n > 0 ? `<button class="btn chico" data-edc="${a.id}" title="La página es un estado de cuenta: convertir sus líneas en movimientos de tarjeta">Es estado de cuenta</button>` : ""}
       <button class="btn chico" data-quitar="${a.id}" ${S.procesando ? "disabled" : ""}>Quitar</button></div>`).join("");
   $$("[data-quitar]").forEach(b => b.addEventListener("click", () => {
@@ -1145,8 +1149,9 @@ function dibujarArchivos() {
     if (!confirm(`¿Tratar "${a.nombre}" como estado de cuenta? Sus ${a.n} líneas dejarán de ser comprobantes y se usarán solo para validar cargos.`)) return;
     convertirAEstadoDeCuenta(a); dibujarArchivos(); dibujarFacturas(); actualizarBotones();
   }));
-  $$("[data-reintentar],[data-releer]").forEach(b => b.addEventListener("click", () => {
-    const a = S.archivos.find(x => x.id === (b.dataset.reintentar || b.dataset.releer));
+  $$("[data-reintentar],[data-releer],[data-leerigual]").forEach(b => b.addEventListener("click", () => {
+    const a = S.archivos.find(x => x.id === (b.dataset.reintentar || b.dataset.releer || b.dataset.leerigual));
+    if (b.dataset.releer || b.dataset.leerigual) a.forzar = true;   // el usuario pide leer de nuevo: no se reutiliza la lectura anterior
     if (b.dataset.releer) {
       const r = prompt(`¿Cuántos comprobantes distintos ves en "${a.nombre}"? (déjalo vacío si no sabes)\nLa IA los buscará todos, incluidos los cortados o tapados.`, a.esperados || "");
       if (r === null) return;
@@ -1199,12 +1204,56 @@ async function prepararArchivo(a) {
   const ctx = cv.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height); ctx.drawImage(bmp, 0, 0, cv.width, cv.height);
   return { tipo: "image/jpeg", datos: cv.toDataURL("image/jpeg", 0.88).split(",")[1] };
 }
+/* ---------- Ahorro de IA ---------- */
+// Lecturas ya hechas en esta sesión, por contenido exacto de la página: si se vuelve a subir el mismo archivo
+// (por ejemplo después de "Reiniciar todo"), se reutiliza la lectura y no se gasta otra consulta. "Releer" la ignora.
+const LECTURAS = new Map();
+async function huella(datos) {
+  try {
+    const buf = typeof datos === "string" ? new TextEncoder().encode(datos) : datos;
+    const h = await crypto.subtle.digest("SHA-256", buf); return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("");
+  } catch { return null; }
+}
+/** ¿La página está en blanco? (reverso de hojas escaneadas, separadores). Se revisa una miniatura, sin IA. */
+async function paginaEnBlanco(a) {
+  try {
+    let fuente;
+    if (a.bytes || a.fuentePdf) {
+      const pdf = await abrirPdfJs(a.fuentePdf || a.bytes);
+      const page = await pdf.getPage(a.fuentePdf ? a.pagina : 1), v1 = page.getViewport({ scale: 1 });
+      const vp = page.getViewport({ scale: 500 / Math.max(v1.width, v1.height) });
+      const cv = document.createElement("canvas"); cv.width = Math.ceil(vp.width); cv.height = Math.ceil(vp.height);
+      const ctx = cv.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
+      await page.render({ canvasContext: ctx, viewport: vp }).promise; page.cleanup();
+      if (a.bytes) pdfJsCache.delete(a.bytes);
+      fuente = cv;
+    } else if (a.file && /^image\//.test(a.file.type || "")) {
+      const bmp = await createImageBitmap(a.file), k = 500 / Math.max(bmp.width, bmp.height);
+      fuente = document.createElement("canvas"); fuente.width = Math.ceil(bmp.width * k); fuente.height = Math.ceil(bmp.height * k);
+      fuente.getContext("2d").drawImage(bmp, 0, 0, fuente.width, fuente.height);
+    } else return false;
+    const { data } = fuente.getContext("2d").getImageData(0, 0, fuente.width, fuente.height);
+    let oscuros = 0, n = 0;
+    for (let i = 0; i < data.length; i += 4) { n++; if (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2] < 215) oscuros++; }
+    return n > 0 && oscuros / n < 0.0005;   // prácticamente sin tinta (menos de 0,05 % de píxeles); ante cualquier marca se lee
+  } catch { return false; }   // ante la duda, se lee
+}
 async function extraerArchivo(a) {
   a.estado = "proc"; a.error = ""; dibujarArchivos();
+  const forzar = !!a.forzar; a.forzar = false;
   try {
+    if (!forzar && await paginaEnBlanco(a)) {
+      a.estado = "ok"; a.enBlanco = true; a.n = 0; a.nMov = 0; a.modelo = "";
+      S.facturas = S.facturas.filter(f => f.archivoId !== a.id); S.movimientos = S.movimientos.filter(m => m.archivoId !== a.id);
+      dibujarArchivos(); dibujarFacturas(); return;
+    }
+    a.enBlanco = false;
     const { tipo, datos } = await prepararArchivo(a);
+    const h = a.huellaOrigen ? `${a.huellaOrigen}#${a.pagina || 1}` : await huella(datos);
+    const clave = h && `${h}|${a.esperados || ""}`;
     let data = null, fallos = 0;
-    for (let intento = 0; ; intento++) {
+    if (clave && !forzar && LECTURAS.has(clave)) { data = { ...LECTURAS.get(clave), modelo: "lectura reutilizada" }; }
+    else for (let intento = 0; ; intento++) {
       let r;
       try { r = await sb.functions.invoke(C.FUNCION_EXTRACCION, { body: { archivo: a.nombre, tipo, datos, esperados: a.esperados || null } }); }
       catch (e) { r = { error: { message: e?.message || String(e) } }; }
@@ -1237,6 +1286,8 @@ async function extraerArchivo(a) {
       }
       throw new Error(msg);
     }
+    if (clave && data && data.modelo !== "lectura reutilizada" && ((data.facturas || []).length || (data.movimientos || []).length || data.tipo_pagina === "continuacion"))
+      LECTURAS.set(clave, data);
     const lista = data?.facturas || [], movs = data?.movimientos || [];
     S.facturas = S.facturas.filter(f => f.archivoId !== a.id);
     const esCont = data?.tipo_pagina === "continuacion";
@@ -2970,7 +3021,7 @@ $("#bSugRefrescar").addEventListener("click", cargarSugerencias);
 /** Huella de lo que se envía a revisar: si no cambió, no se vuelve a gastar una consulta */
 function firmaRevision() {
   const R = S.resultados; if (!R) return "";
-  return R.cab?.informe + "|" + filasVista(R).map(v => `${v.x?.linea?.id_gasto}:${v.campos.filter(k => !k.regla).map(k => k.c + (k.stOriginal || k.st)).join(",")}`).join(";");
+  return R.cab?.informe + "|" + filasVista(R, { incluirEliminadas: true }).map(v => `${v.x?.linea?.id_gasto}:${v.campos.filter(k => !k.regla).map(k => k.c + (k.stOriginal || k.st)).join(",")}`).join(";");
 }
 /** Resumen compacto de los resultados para la revisión con reglas */
 function filasParaRevision(R) {
