@@ -26,6 +26,7 @@ window.CONFIG = {
   // Procesamiento de facturas
   DIVIDIR_PDF_POR_PAGINA: true,     // cada página se lee por separado (más rápido y confiable)
   PROCESOS_SIMULTANEOS: 3,         // las páginas se reparten entre Gemini 3.5 y 3.1 Flash-Lite (~15 por minuto cada uno)
+  REINTENTOS_ERROR: 3,              // reintentos automáticos por página cuando falla la conexión o la IA (errores temporales)
   REINTENTOS_LIMITE: 8,             // reintentos automáticos cuando todos los modelos están ocupados en el minuto (varios usuarios a la vez)
   TABLA_USO_MODELOS: "uso_modelos",
   NOMBRE_PLATAFORMA: "Agentes IA LCA",   // nombre que se ve en el login y en la barra superior
@@ -400,14 +401,14 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
   <div class="tarjeta cap oculto" id="capIA" aria-live="polite">
     <div class="cap-cab">
       <div class="cap-hero">
-        <div class="cap-tit">Capacidad de IA hoy <span class="cap-info" tabindex="0" data-tip="Compartida por todo el equipo. Cada página usa el modelo más potente con cupo; al agotarse pasa al siguiente.">ⓘ</span></div>
+        <div class="cap-tit">Capacidad de IA hoy <span class="cap-info" tabindex="0" data-tip="Compartida por todo el equipo. Cada página usa el primer modelo de la lista con cupo (los más rápidos primero); al agotarse pasa al siguiente.">ⓘ</span></div>
         <div class="cap-num"><b id="capLibres">–</b> <span>lecturas disponibles</span></div>
         <div class="cap-meter" id="capMeter"><i></i></div>
         <div class="cap-sub" id="capSub"></div>
       </div>
       <div class="cap-modelos" id="capModelos"></div>
     </div>
-    <div class="cap-pie"><span class="cap-orden">Orden de uso: más potente → más rendidor</span>
+    <div class="cap-pie"><span class="cap-orden">Orden de uso: más rápidos primero → más potentes de respaldo</span>
       <button class="btn chico" id="bCapTabla" aria-expanded="false">Ver tabla</button>
       <button class="btn chico" id="bCap" title="Actualizar">↻</button></div>
     <div class="scroll oculto" id="capTablaWrap"><table class="cap-tabla" id="tCap"></table></div>
@@ -1088,6 +1089,7 @@ prepararZona($("#zFact"), $("#fFact"), agregarArchivos);
 
 async function agregarArchivos(files) {
   if (C.MODO_LECTURA === "copilot") return agregarArchivosCopilot(files);
+  calentarFuncion();
   const validos = files.filter(f => /pdf|jpe?g|png|webp/i.test(f.type) || /\.(pdf|jpe?g|png|webp)$/i.test(f.name));
   if (validos.length < files.length) toast("Algunos archivos se omitieron (solo PDF, JPG, PNG o WEBP). Las fotos HEIC de iPhone deben convertirse a JPG.", 6000);
   for (const file of validos) {
@@ -1201,12 +1203,26 @@ async function extraerArchivo(a) {
   a.estado = "proc"; a.error = ""; dibujarArchivos();
   try {
     const { tipo, datos } = await prepararArchivo(a);
-    let data = null;
+    let data = null, fallos = 0;
     for (let intento = 0; ; intento++) {
-      const r = await sb.functions.invoke(C.FUNCION_EXTRACCION, { body: { archivo: a.nombre, tipo, datos, esperados: a.esperados || null } });
+      let r;
+      try { r = await sb.functions.invoke(C.FUNCION_EXTRACCION, { body: { archivo: a.nombre, tipo, datos, esperados: a.esperados || null } }); }
+      catch (e) { r = { error: { message: e?.message || String(e) } }; }
       if (!r.error) { data = r.data; break; }
       let msg = r.error.message, status = r.error.context?.status, j = {};
       try { j = await r.error.context.json(); msg = j.error || msg; } catch {}
+      const deRed = /failed to send|failed to fetch|networkerror|load failed|network|timeout|aborted/i.test(msg) || !status;
+      // Errores temporales (función arrancando, red, error 5xx, respuesta incompleta de la IA): hasta REINTENTOS_ERROR reintentos
+      const definitivo = [400, 401, 403, 404, 413].includes(status) || (status === 429 && j.diario)
+        || /Falta configurar|PUBLISHABLE_KEY|rechazó la llave|No autorizado|no soportado/i.test(msg);   // configuración: reintentar no sirve
+      if (!definitivo && status !== 429 && fallos < C.REINTENTOS_ERROR) {
+        fallos++;
+        const espera = [5, 15, 30][fallos - 1] || 30;
+        a.error = `${deRed ? "La función no respondió" : "Error temporal" + (status ? ` (${status})` : "")}: reintento ${fallos} de ${C.REINTENTOS_ERROR} en ${espera} s…`; dibujarArchivos();
+        if (deRed) calentarFuncion();
+        await new Promise(res => setTimeout(res, espera * 1000));
+        a.error = ""; dibujarArchivos(); continue;
+      }
       if (status === 429 && !j.diario && intento < C.REINTENTOS_LIMITE) {
         // El servidor indica cuántos segundos faltan para que se libere un turno; se agrega un desfase aleatorio
         // para que varios usuarios no reintenten todos en el mismo segundo.
@@ -1215,9 +1231,9 @@ async function extraerArchivo(a) {
         await new Promise(res => setTimeout(res, espera * 1000));
         a.error = ""; dibujarArchivos(); continue;
       }
-      if (/failed to send|failed to fetch|networkerror|load failed/i.test(msg)) {
+      if (deRed) {
         S.funcionCaida = true;
-        throw new Error("No se pudo contactar la función: revisa que exista 'extraer-factura', que Verify JWT esté apagado y el secreto ALLOWED_ORIGIN");
+        throw new Error(`No se pudo contactar la función después de ${C.REINTENTOS_ERROR} reintentos: revisa tu conexión; si persiste, revisa que exista 'extraer-factura', que Verify JWT esté apagado y el secreto ALLOWED_ORIGIN`);
       }
       throw new Error(msg);
     }
@@ -1308,6 +1324,11 @@ async function extraerTodas() {
   const avanzar = () => { $("#barra i").style.width = `${(hechos / total) * 100}%`; $("#extraerInfo").textContent = `${hechos} de ${total} archivos/páginas`; };
   avanzar();
   S.funcionCaida = false;
+  // Despertar la función (arranque en frío) y leer la primera página sola: así las demás no chocan con el arranque
+  $("#extraerInfo").textContent = "Preparando el servicio de lectura…";
+  await calentarFuncion(true);
+  avanzar();
+  if (cola.length > 1) { const a = cola.shift(); await extraerArchivo(a); hechos++; avanzar(); }
   const trabajador = async () => {
     while (cola.length) {
       if (S.funcionCaida) { cola.length = 0; break; }   // no insistir con las demás páginas si la función no responde
@@ -1323,6 +1344,14 @@ async function extraerTodas() {
   dibujarArchivos(); actualizarBotones();
 }
 $("#bExtraer").addEventListener("click", extraerTodas);
+/** Despierta la Edge Function (las funciones de Supabase se duermen tras un rato sin uso). No gasta IA. */
+let ultimoCalentado = 0;
+async function calentarFuncion(esperar = false) {
+  if (!sb || Date.now() - ultimoCalentado < 60000) return;
+  ultimoCalentado = Date.now();
+  const p = sb.functions.invoke(C.FUNCION_EXTRACCION, { body: { modo: "ping" } }).catch(() => {});
+  if (esperar) await Promise.race([p, new Promise(r => setTimeout(r, 25000))]);
+}
 /** Panel de capacidad compartida: lee el contador de la tabla uso_modelos (lo actualiza la función al leer) */
 let capPend = null, capTimer = null;
 function cargarCapacidad() { clearTimeout(capPend); capPend = setTimeout(cargarCapacidadAhora, 400); }
@@ -2553,7 +2582,7 @@ const ICONOS = {
 const svgIco = k => `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONOS[k] || ICONOS.modulo}"/></svg>`;
 /** Pantallas publicadas en este archivo. Un módulo de la base de datos sin entrada aquí se muestra "en construcción". */
 const MODULOS_APP = {
-  [MOD_REVISOR]: { el: "#mRevisor", alAbrir: () => { cargarCapacidad(); } },
+  [MOD_REVISOR]: { el: "#mRevisor", alAbrir: () => { cargarCapacidad(); calentarFuncion(); } },
 };
 const PL = { modulos: [], permitidos: new Set(), instalada: true, asignaciones: [] };
 const puedeUsar = clave => PL.permitidos.has(clave);
