@@ -2630,7 +2630,7 @@ function renderResultados(cont, R, opts = {}) {
 /** Botón "Ver" del comprobante (solo si la página sigue cargada en esta sesión) */
 function botonVerDoc(f) {
   if (!f?.archivoId || !S.archivos.some(a => a.id === f.archivoId)) return "";
-  return `<button type="button" class="btn-ver" data-verdoc="${esc(f.archivoId)}" title="Ver el comprobante: ${esc(f.archivo || "")}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg> Ver</button>`;
+  return `<button type="button" class="btn-ver" data-verdoc="${esc(f.archivoId)}" title="Ver el comprobante: ${esc(f.archivo || "")}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg> Ver adjunto</button>`;
 }
 function filaResultado(v, ml, editable = false) {
   const x = v.x, f = x.factura, l = x.linea, st = v.estado === "na" ? "ok" : v.estado;
