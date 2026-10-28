@@ -268,6 +268,21 @@ header.modbar nav button.activo{background:none;color:var(--tinta);border-bottom
 .dictamen.error{background:var(--err-bg);border-color:#F3C2BE} .dictamen.info{background:#EEF1F4}
 .dictamen ul{margin:6px 0 0;padding-left:20px} .dictamen .propuesta{margin-top:10px;padding:8px 10px;background:#fff;border:1px dashed var(--borde);border-radius:6px}
 .chip.regla{background:#EEF3FF;color:#1A56C4}
+/* ---- Ver comprobante ---- */
+.btn-ver{display:flex;width:max-content;align-items:center;gap:5px;margin-top:8px;padding:4px 10px 4px 8px;border:0;border-radius:999px;background:var(--primario);color:#fff;font-size:12px;font-weight:700;cursor:pointer;box-shadow:0 1px 3px rgba(227,6,19,.35);white-space:nowrap}
+.btn-ver:hover{background:var(--primario-osc);transform:translateY(-1px)}
+.btn-ver svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.visor{position:fixed;inset:0;z-index:60;background:rgba(17,20,24,.88);display:flex;flex-direction:column}
+.visor-barra{display:flex;align-items:center;gap:12px;justify-content:space-between;padding:10px 16px;background:#111418;color:#fff;flex-wrap:wrap}
+.visor-tit{display:flex;flex-direction:column;min-width:0} .visor-tit b{font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60vw} .visor-tit span{color:#9AA3AD}
+.visor-ctrl{display:flex;align-items:center;gap:6px}
+.vbtn{background:#2A3038;color:#fff;border:0;border-radius:6px;min-width:34px;height:32px;padding:0 10px;font-size:15px;font-weight:600;cursor:pointer}
+.vbtn:hover{background:#3A424C} .vbtn:disabled{opacity:.35;cursor:default} .vbtn.cerrar{background:var(--primario)}
+.vsep{width:1px;height:22px;background:#3A424C;margin:0 4px}
+.visor-cuerpo{flex:1;overflow:auto;display:flex;justify-content:center;align-items:flex-start;padding:20px}
+.visor-hoja{display:flex;flex-direction:column;gap:14px;align-items:center;transform-origin:top center}
+.visor-hoja img,.visor-hoja canvas{background:#fff;box-shadow:0 6px 30px rgba(0,0,0,.5);border-radius:2px;display:block}
+.visor-cargando{color:#C9CED4;padding:40px}
 /* ---- Capacidad de IA ---- */
 .cap{--uso:#1A56C4;--pista:#E6E9EE;padding:14px 18px}
 .cap-cab{display:flex;gap:20px;align-items:stretch;flex-wrap:wrap}
@@ -286,7 +301,7 @@ header.modbar nav button.activo{background:none;color:var(--tinta);border-bottom
 .cap-anillo text{font-size:9.5px;letter-spacing:-.02em;font-weight:700;fill:var(--tinta);text-anchor:middle;dominant-baseline:central;font-variant-numeric:tabular-nums}
 .cap-m .nom{font-size:11.5px;font-weight:600;color:var(--tinta);line-height:1.2;white-space:nowrap}
 .cap-m .det{font-size:11px;color:var(--tenue);font-variant-numeric:tabular-nums}
-.cap-m .est{font-size:11px;font-weight:600;white-space:nowrap} .est.ok{color:var(--ok)} .est.warn{color:var(--warn)} .est.error{color:var(--err)}
+.cap-m .est{font-size:11px;font-weight:600;white-space:nowrap} .est.ok{color:var(--ok)} .est.warn{color:var(--warn)} .est.error{color:var(--err)} .est.na{color:var(--tenue)}
 .cap-m .pri{position:absolute;bottom:4px;right:6px;font-size:10px;color:var(--tenue)}
 .cap-pie{display:flex;align-items:center;gap:8px;margin-top:10px} .cap-orden{flex:1;font-size:12px;color:var(--tenue)}
 .cap-tabla{border-collapse:collapse;width:100%;margin-top:8px;font-size:13px} .cap-tabla th,.cap-tabla td{padding:4px 8px;border-bottom:1px solid var(--borde);text-align:left}
@@ -647,6 +662,25 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
 </div><!-- /vApp -->
 
 <div id="toast" class="toast oculto"></div>
+
+<!-- ============ VISOR DE COMPROBANTES ============ -->
+<div id="visor" class="visor oculto" role="dialog" aria-modal="true" aria-label="Comprobante">
+  <div class="visor-barra">
+    <div class="visor-tit"><b id="visorNombre"></b><span id="visorPag" class="mini"></span></div>
+    <div class="visor-ctrl">
+      <button class="vbtn" data-v="ant" title="Página anterior del mismo archivo">‹</button>
+      <button class="vbtn" data-v="sig" title="Página siguiente del mismo archivo">›</button>
+      <span class="vsep"></span>
+      <button class="vbtn" data-v="menos" title="Alejar">−</button>
+      <button class="vbtn" data-v="ajustar" title="Ajustar a la pantalla">Ajustar</button>
+      <button class="vbtn" data-v="mas" title="Acercar">+</button>
+      <button class="vbtn" data-v="girar" title="Girar">⟳</button>
+      <span class="vsep"></span>
+      <button class="vbtn cerrar" data-v="cerrar" title="Cerrar (Esc)">✕</button>
+    </div>
+  </div>
+  <div class="visor-cuerpo" id="visorCuerpo"><div class="visor-hoja" id="visorHoja"></div></div>
+</div>
 
 <script>
 "use strict";
@@ -1204,6 +1238,79 @@ async function prepararArchivo(a) {
   const ctx = cv.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height); ctx.drawImage(bmp, 0, 0, cv.width, cv.height);
   return { tipo: "image/jpeg", datos: cv.toDataURL("image/jpeg", 0.88).split(",")[1] };
 }
+/* ---------- Visor de comprobantes ---------- */
+const VISOR = { id: null, zoom: 1, ajustar: true, giro: 0 };
+/** Dibuja la página de un archivo cargado: PDF (página dividida o completo) o imagen */
+async function dibujarPagina(a, hoja) {
+  hoja.innerHTML = '<div class="visor-cargando">Cargando…</div>';
+  const nodos = [];
+  if (a.bytes || a.fuentePdf || (a.file && a.tipo === "application/pdf")) {
+    const fuente = a.fuentePdf || a.bytes || a.file;
+    const pdf = await abrirPdfJs(fuente);
+    const paginas = a.fuentePdf ? [a.pagina] : a.bytes ? [1] : Array.from({ length: pdf.numPages }, (_, i) => i + 1);
+    for (const n of paginas) {
+      const page = await pdf.getPage(n), v1 = page.getViewport({ scale: 1 });
+      const vp = page.getViewport({ scale: Math.min(3, 1800 / Math.max(v1.width, v1.height)) });
+      const cv = document.createElement("canvas"); cv.width = Math.ceil(vp.width); cv.height = Math.ceil(vp.height);
+      const ctx = cv.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
+      await page.render({ canvasContext: ctx, viewport: vp }).promise; page.cleanup();
+      nodos.push(cv);
+    }
+    if (a.bytes) pdfJsCache.delete(a.bytes);
+  } else {
+    const img = new Image(); img.alt = a.nombre;
+    img.src = a.url || URL.createObjectURL(a.blob || a.file);
+    await img.decode().catch(() => {});
+    nodos.push(img);
+  }
+  hoja.innerHTML = ""; nodos.forEach(n => hoja.appendChild(n));
+}
+function aplicarZoomVisor() {
+  const cuerpo = $("#visorCuerpo"), hoja = $("#visorHoja");
+  const els = $$("img,canvas", hoja); if (!els.length) return;
+  const girado = VISOR.giro % 180 !== 0;
+  els.forEach(el => {
+    const w = el.naturalWidth || el.width, h = el.naturalHeight || el.height;
+    const [ancho, alto] = girado ? [h, w] : [w, h];
+    const escala = VISOR.ajustar ? Math.min((cuerpo.clientWidth - 40) / ancho, (cuerpo.clientHeight - 40) / alto, 1.5) : VISOR.zoom;
+    el.style.width = `${w * escala}px`; el.style.height = `${h * escala}px`;
+    el.style.transform = VISOR.giro ? `rotate(${VISOR.giro}deg)` : "";
+    el.style.margin = girado ? `${Math.abs(w - h) * escala / 2}px ${-Math.abs(w - h) * escala / 2}px` : "";
+    if (VISOR.ajustar) VISOR.zoom = escala;
+  });
+}
+/** Páginas del mismo archivo original, en orden, para navegar con ‹ › */
+const paginasDelOrigen = a => S.archivos.filter(x => x.origen === a.origen).sort((p, q) => (p.pagina || 0) - (q.pagina || 0));
+async function verDocumento(id) {
+  const a = S.archivos.find(x => x.id === id); if (!a) return toast("El documento ya no está cargado en esta sesión.");
+  VISOR.id = id; VISOR.giro = 0; VISOR.ajustar = true;
+  $("#visor").classList.remove("oculto"); document.body.style.overflow = "hidden";
+  const hermanas = paginasDelOrigen(a), i = hermanas.indexOf(a);
+  $("#visorNombre").textContent = a.origen || a.nombre;
+  $("#visorPag").textContent = hermanas.length > 1 ? `Página ${a.pagina || i + 1} de ${hermanas.length}` : "";
+  $("[data-v=ant]").disabled = i <= 0; $("[data-v=sig]").disabled = i < 0 || i >= hermanas.length - 1;
+  try { await dibujarPagina(a, $("#visorHoja")); aplicarZoomVisor(); }
+  catch (e) { console.error(e); $("#visorHoja").innerHTML = `<div class="visor-cargando">No se pudo mostrar el documento: ${esc(e.message || e)}</div>`; }
+}
+function cerrarVisor() { $("#visor").classList.add("oculto"); document.body.style.overflow = ""; $("#visorHoja").innerHTML = ""; VISOR.id = null; }
+$$("#visor [data-v]").forEach(b => b.addEventListener("click", () => {
+  const op = b.dataset.v, a = S.archivos.find(x => x.id === VISOR.id);
+  if (op === "cerrar") return cerrarVisor();
+  if (op === "ant" || op === "sig") { const h = paginasDelOrigen(a), i = h.indexOf(a) + (op === "sig" ? 1 : -1); if (h[i]) verDocumento(h[i].id); return; }
+  if (op === "ajustar") VISOR.ajustar = true;
+  if (op === "mas" || op === "menos") { VISOR.ajustar = false; VISOR.zoom = Math.min(4, Math.max(0.2, VISOR.zoom * (op === "mas" ? 1.25 : 0.8))); }
+  if (op === "girar") VISOR.giro = (VISOR.giro + 90) % 360;
+  aplicarZoomVisor();
+}));
+$("#visor").addEventListener("click", e => { if (e.target.id === "visor" || e.target.id === "visorCuerpo") cerrarVisor(); });
+document.addEventListener("keydown", e => {
+  if ($("#visor").classList.contains("oculto")) return;
+  if (e.key === "Escape") cerrarVisor();
+  if (e.key === "ArrowRight") $("[data-v=sig]").click();
+  if (e.key === "ArrowLeft") $("[data-v=ant]").click();
+});
+window.addEventListener("resize", () => { if (VISOR.id && VISOR.ajustar) aplicarZoomVisor(); });
+
 /* ---------- Ahorro de IA ---------- */
 // Lecturas ya hechas en esta sesión, por contenido exacto de la página: si se vuelve a subir el mismo archivo
 // (por ejemplo después de "Reiniciar todo"), se reutiliza la lectura y no se gasta otra consulta. "Releer" la ignora.
@@ -1423,30 +1530,34 @@ async function cargarCapacidadAhora() {
   $("#capIA").classList.remove("oculto");
   // día de cupo en hora del Pacífico, igual que en la base de datos
   const hoy = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles" }).format(new Date());
-  const ahora = Date.now(), minActual = Math.floor(ahora / 60000);
+  const ahora = Date.now();
   let usados = 0, cupo = 0, libresMin = 0;
   const filas = lista.map(m => {
+    const noDisp = m.no_disponible_hasta && new Date(m.no_disponible_hasta).getTime() > ahora;
     const u = m.dia === hoy ? m.usados_dia : 0;
     const hasta = m.agotado_hasta ? new Date(m.agotado_hasta).getTime() : 0;
-    const agotadoDia = (hasta > ahora && hasta - ahora > 120000) || u >= m.rpd;
-    const pausa = !agotadoDia && hasta > ahora;
-    const enMin = m.minuto && Math.floor(new Date(m.minuto).getTime() / 60000) === minActual ? m.usados_minuto : 0;
-    const usadosEf = agotadoDia ? m.rpd : u;
-    usados += usadosEf; cupo += m.rpd;
-    if (!agotadoDia && !pausa) libresMin += Math.max(0, m.rpm - enMin);
-    const est = agotadoDia ? { c: "error", t: "⛔ Agotado", l: "Agotado hoy" } : pausa ? { c: "warn", t: "⏸ En pausa", l: "En pausa (1 min)" } : { c: "ok", t: "● Disponible", l: "Disponible" };
-    return { m, u: usadosEf, enMin, est, agotadoDia };
+    const agotadoDia = !noDisp && ((hasta > ahora && hasta - ahora > 120000) || u >= m.rpd);
+    const pausa = !noDisp && !agotadoDia && hasta > ahora;
+    // consultas de los últimos 60 segundos (igual que cuenta Google)
+    const enMin = Array.isArray(m.ultimas) ? m.ultimas.filter(x => ahora - new Date(x).getTime() < 60000).length
+      : (m.minuto && ahora - new Date(m.minuto).getTime() < 60000 ? m.usados_minuto : 0);
+    const usadosEf = noDisp ? 0 : u;                              // lo que de verdad se consumió (como Google)
+    if (!noDisp) { usados += agotadoDia ? m.rpd : u; cupo += m.rpd; }   // si Google dijo "agotado hoy", ya no queda cupo en ese modelo
+    if (!noDisp && !agotadoDia && !pausa) libresMin += Math.max(0, m.rpm - enMin);
+    const est = noDisp ? { c: "na", t: "○ No disponible", l: "Google respondió que no existe en tu proyecto; se vuelve a probar en 1 hora" }
+      : agotadoDia ? { c: "error", t: "⛔ Agotado", l: "Agotado hoy" } : pausa ? { c: "warn", t: "⏸ En pausa", l: "En pausa (1 min)" } : { c: "ok", t: "● Disponible", l: "Disponible" };
+    return { m, u: usadosEf, enMin, est, agotadoDia: agotadoDia || noDisp };
   });
   const libres = Math.max(0, cupo - usados);
   $("#capLibres").textContent = libres.toLocaleString("es-CR");
   $("#capMeter i").style.width = `${cupo ? (libres / cupo) * 100 : 0}%`;
   $("#capMeter").title = `${libres} de ${cupo} lecturas libres hoy`;
-  $("#capSub").textContent = `de ~${cupo.toLocaleString("es-CR")} hoy · ${libresMin} libres este minuto · reinicia 1:00 a. m.`;
+  $("#capSub").textContent = `de ~${cupo.toLocaleString("es-CR")} hoy · ${libresMin} libres ahora · reinicia 1:00 a. m.`;
   $("#capModelos").innerHTML = filas.map(({ m, u, enMin, est, agotadoDia }) =>
-    `<div class="cap-m${agotadoDia ? " agotado" : ""}" tabindex="0" data-tip="${esc(m.modelo)} · ${u} de ${m.rpd} lecturas hoy · ${enMin} de ${m.rpm} en este minuto · ${est.l}">
+    `<div class="cap-m${agotadoDia ? " agotado" : ""}" tabindex="0" data-tip="${esc(m.modelo)} · ${u} de ${m.rpd} lecturas hoy · ${enMin} de ${m.rpm} en los últimos 60 s · ${est.l}${m.ultimo_error && (agotadoDia || est.c !== "ok") ? " · Google: " + esc(m.ultimo_error) : ""}">
       <span class="pri">${m.prioridad}</span>${anillo(u / Math.max(1, m.rpd))}
-      <div><div class="nom">${esc(nombreModelo(m.modelo))}</div><div class="det">${u}/${m.rpd} hoy</div><div class="est ${est.c}">${est.t}</div></div></div>`).join("");
-  $("#tCap").innerHTML = `<tr><th>#</th><th>Modelo</th><th class="n">Lecturas hoy</th><th class="n">Cupo diario</th><th class="n">Este minuto</th><th>Estado</th></tr>` +
+      <div><div class="nom">${esc(nombreModelo(m.modelo))}</div><div class="det">${est.c === "na" ? "fuera del proyecto" : `${u}/${m.rpd} hoy`}</div><div class="est ${est.c}">${est.t}</div></div></div>`).join("");
+  $("#tCap").innerHTML = `<tr><th>#</th><th>Modelo</th><th class="n">Lecturas hoy</th><th class="n">Cupo diario</th><th class="n">Últimos 60 s</th><th>Estado</th></tr>` +
     filas.map(({ m, u, enMin, est }) => `<tr><td>${m.prioridad}</td><td>${esc(m.modelo)}</td><td class="n">${u}</td><td class="n">${m.rpd}</td><td class="n">${enMin} / ${m.rpm}</td><td>${est.l}</td></tr>`).join("");
   // refresco automático cada 30 s mientras la pestaña está visible
   clearTimeout(capTimer); capTimer = setTimeout(() => { if (!document.hidden && !$("#tNueva").classList.contains("oculto")) cargarCapacidadAhora(); else cargarCapacidad(); }, 30000);
@@ -2514,6 +2625,12 @@ function renderResultados(cont, R, opts = {}) {
   const bg = $("[data-acc=guardar]", cont); if (bg) bg.addEventListener("click", () => guardar(R, bg));
   const bn = $("[data-acc=nueva]", cont); if (bn) bn.addEventListener("click", reiniciarTodo);
   const bb = $("[data-acc=borrar]", cont); if (bb) bb.addEventListener("click", () => borrarRegistro(registro.id));
+  $$("[data-verdoc]", cont).forEach(b => b.addEventListener("click", () => verDocumento(b.dataset.verdoc)));
+}
+/** Botón "Ver" del comprobante (solo si la página sigue cargada en esta sesión) */
+function botonVerDoc(f) {
+  if (!f?.archivoId || !S.archivos.some(a => a.id === f.archivoId)) return "";
+  return `<button type="button" class="btn-ver" data-verdoc="${esc(f.archivoId)}" title="Ver el comprobante: ${esc(f.archivo || "")}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg> Ver</button>`;
 }
 function filaResultado(v, ml, editable = false) {
   const x = v.x, f = x.factura, l = x.linea, st = v.estado === "na" ? "ok" : v.estado;
@@ -2532,7 +2649,7 @@ function filaResultado(v, ml, editable = false) {
   if (v.tipo === "propina") {
     const t = v.tip;
     return `<tr data-st="${st}" style="background:#FCFCFD">
-      <td style="white-space:nowrap"><b style="font-size:15px">${esc(t.id_gasto)}</b><div class="mini muted">propina de ${esc(l.solo_propina ? "—" : l.id_gasto)}</div></td>
+      <td style="white-space:nowrap"><b style="font-size:15px">${esc(t.id_gasto)}</b><div class="mini muted">propina de ${esc(l.solo_propina ? "—" : l.id_gasto)}</div>${botonVerDoc(f)}</td>
       <td title="${v.manual ? "Aprobado manualmente" : TXT_ESTADO[st]}" style="font-size:16px">${ICONO[st]}${v.manual ? '<div class="mini muted" style="font-size:10px">manual</div>' : ""}</td>
       <td><b>${esc(t.numero)}</b><div class="mini">${esc(l.proveedor)}</div><div class="mini muted">Gasto ${esc(fFecha(t.fecha_gasto || l.fecha_gasto) || "—")} · línea de propina</div></td>
       <td class="mini">${f ? `Propina de la factura <b>${esc(f.numero || f.clave || "")}</b>` : '<span class="muted">— sin comprobante —</span>'}</td>
@@ -2542,7 +2659,7 @@ function filaResultado(v, ml, editable = false) {
   }
   const conPropinaAparte = (l?.propinas || []).length > 0;
   return `<tr data-st="${st}">
-    <td style="white-space:nowrap"><b style="font-size:15px">${esc(l ? l.id_gasto : "—")}</b></td>
+    <td style="white-space:nowrap"><b style="font-size:15px">${esc(l ? l.id_gasto : "—")}</b>${botonVerDoc(f)}</td>
     <td title="${v.manual ? "Aprobado manualmente" : TXT_ESTADO[st]}" style="font-size:16px">${ICONO[st]}${v.manual ? '<div class="mini muted" style="font-size:10px">manual</div>' : ""}</td>
     <td style="min-width:170px">${l ? `<b>${esc(l.numero)}</b><div class="mini">${esc(l.proveedor)}</div><div class="mini muted">Gasto ${esc(fFecha(l.fecha_gasto) || "—")}${l.fecha_inicio ? ` · estadía ${esc(fFecha(l.fecha_inicio))}–${esc(fFecha(l.fecha_fin))}` : ""}${l.finalidad ? " · " + esc(l.finalidad) : ""}</div>${l.tipo_gasto ? `<div class="mini muted">${esc(l.tipo_gasto)}</div>` : ""}` : '<span class="muted">— sin línea en SAP —</span>'}</td>
     <td style="min-width:170px">${f ? `<b>${esc(f.numero || f.clave || "Sin número")}</b><div class="mini">${esc(f.proveedor)}${f.nombre_comercial ? ` <span class="muted">(${esc(f.nombre_comercial)})</span>` : ""}</div><div class="mini muted">${esc([fFecha(f.fecha), f.hora, f.pais, f.categoria].filter(Boolean).join(" · "))}</div><div class="mini muted">${esc(f.archivo)}</div>` : '<span class="muted">— sin comprobante —</span>'}</td>
