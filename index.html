@@ -876,7 +876,8 @@ async function mostrarSesion(session) {
   const ok = !!session;
   $("#vLogin").classList.toggle("oculto", ok);
   $("#vApp").classList.toggle("oculto", !ok);
-  if (!ok) { sesionCargada = null; return; }
+  if (!ok) { if (sesionCargada) { location.replace(location.pathname); return; } sesionCargada = null; return; }   // salir: borra todo lo cargado
+  if (sesionCargada && sesionCargada !== session.user.id) { location.reload(); return; }   // otro usuario en la misma pestaña: empezar limpio
   const nombre = session.user.user_metadata?.nombre;
   $("#uEmail").textContent = nombre ? `${nombre} · ${session.user.email}` : session.user.email;
   sesionUid = session.user.id;
@@ -1124,14 +1125,19 @@ prepararZona($("#zFact"), $("#fFact"), agregarArchivos);
 async function agregarArchivos(files) {
   if (C.MODO_LECTURA === "copilot") return agregarArchivosCopilot(files);
   calentarFuncion();
-  const huellas = new Map();
   const validos = files.filter(f => /pdf|jpe?g|png|webp/i.test(f.type) || /\.(pdf|jpe?g|png|webp)$/i.test(f.name));
   if (validos.length < files.length) toast("Algunos archivos se omitieron (solo PDF, JPG, PNG o WEBP). Las fotos HEIC de iPhone deben convertirse a JPG.", 6000);
   for (const file of validos) {
     if (file.size > C.MAX_MB_ARCHIVO * 1048576) { toast(`${file.name} supera ${C.MAX_MB_ARCHIVO} MB`); continue; }
-    if (S.archivos.some(a => a.origen === file.name && a.tamOrigen === file.size)) continue;
+    // Cada archivo se identifica por su contenido (huella) y un id propio, nunca por el nombre:
+    // dos archivos distintos pueden llamarse igual (scan.pdf, pdf24_unido.pdf, IMG_0001.jpg…)
+    const hOrigen = await huella(await file.arrayBuffer());
+    if (hOrigen && S.archivos.some(a => a.huellaOrigen === hOrigen)) { toast(`"${file.name}" ya está cargado (mismo contenido).`); continue; }
+    if (!hOrigen && S.archivos.some(a => a.origen === file.name && a.tamOrigen === file.size)) continue;
+    const origenId = uid();
+    const repetidos = new Set(S.archivos.filter(a => a.origenBase === file.name).map(a => a.origenId)).size;
+    const nombreArch = repetidos ? `${file.name} (${repetidos + 1})` : file.name;   // mismo nombre, otro contenido: se distingue en pantalla
     const esPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
-    huellas.set(file.name + "|" + file.size, await huella(await file.arrayBuffer()));   // para reutilizar lecturas del mismo archivo
     if (esPdf && C.DIVIDIR_PDF_POR_PAGINA && window.PDFLib) {
       $("#extraerInfo").textContent = `Preparando ${file.name} (${(file.size / 1048576).toFixed(1)} MB)…`;
       try {
@@ -1141,7 +1147,7 @@ async function agregarArchivos(files) {
           const doc = await PDFLib.PDFDocument.create();
           const [pg] = await doc.copyPages(src, [i]); doc.addPage(pg);
           const bytes = await doc.save();
-          S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, pagina: i + 1, nombre: n > 1 ? `${file.name} · pág. ${i + 1} de ${n}` : file.name, tipo: "application/pdf", bytes, size: bytes.length, estado: "pendiente", error: "", n: 0 });
+          S.archivos.push({ id: uid(), origenId, huellaOrigen: hOrigen, origenBase: file.name, origen: nombreArch, tamOrigen: file.size, pagina: i + 1, nombre: n > 1 ? `${nombreArch} · pág. ${i + 1} de ${n}` : nombreArch, tipo: "application/pdf", bytes, size: bytes.length, estado: "pendiente", error: "", n: 0 });
           if (n > 5) { $("#extraerInfo").textContent = `Preparando ${file.name}: página ${i + 1} de ${n}…`; await new Promise(r => setTimeout(r, 0)); }
         }
         $("#extraerInfo").textContent = "";
@@ -1151,14 +1157,13 @@ async function agregarArchivos(files) {
       try {
         const pdf = await abrirPdfJs(file);
         for (let p = 1; p <= pdf.numPages; p++)
-          S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, pagina: p, nombre: pdf.numPages > 1 ? `${file.name} · pág. ${p} de ${pdf.numPages}` : file.name, tipo: "image/jpeg", fuentePdf: file, size: Math.round(file.size / pdf.numPages), estado: "pendiente", error: "", n: 0 });
+          S.archivos.push({ id: uid(), origenId, huellaOrigen: hOrigen, origenBase: file.name, origen: nombreArch, tamOrigen: file.size, pagina: p, nombre: pdf.numPages > 1 ? `${nombreArch} · pág. ${p} de ${pdf.numPages}` : nombreArch, tipo: "image/jpeg", fuentePdf: file, size: Math.round(file.size / pdf.numPages), estado: "pendiente", error: "", n: 0 });
         $("#extraerInfo").textContent = "";
         continue;
       } catch (err) { console.warn("pdf.js tampoco pudo abrir el PDF; se envía completo", err); $("#extraerInfo").textContent = ""; }
     }
-    S.archivos.push({ id: uid(), origen: file.name, tamOrigen: file.size, nombre: file.name, tipo: esPdf ? "application/pdf" : file.type, file, size: file.size, estado: "pendiente", error: "", n: 0 });
+    S.archivos.push({ id: uid(), origenId, huellaOrigen: hOrigen, origenBase: file.name, origen: nombreArch, tamOrigen: file.size, nombre: nombreArch, tipo: esPdf ? "application/pdf" : file.type, file, size: file.size, estado: "pendiente", error: "", n: 0 });
   }
-  S.archivos.forEach(a => { if (!a.huellaOrigen) a.huellaOrigen = huellas.get(a.origen + "|" + a.tamOrigen) || null; });
   dibujarArchivos(); actualizarBotones();
 }
 function dibujarArchivos() {
@@ -1280,7 +1285,7 @@ function aplicarZoomVisor() {
   });
 }
 /** Páginas del mismo archivo original, en orden, para navegar con ‹ › */
-const paginasDelOrigen = a => S.archivos.filter(x => x.origen === a.origen).sort((p, q) => (p.pagina || 0) - (q.pagina || 0));
+const paginasDelOrigen = a => S.archivos.filter(x => a.origenId ? x.origenId === a.origenId : x.origen === a.origen).sort((p, q) => (p.pagina || 0) - (q.pagina || 0));
 async function verDocumento(id) {
   const a = S.archivos.find(x => x.id === id); if (!a) return toast("El documento ya no está cargado en esta sesión.");
   VISOR.id = id; VISOR.giro = 0; VISOR.ajustar = true;
@@ -1362,8 +1367,10 @@ async function extraerArchivo(a) {
     if (clave && !forzar && LECTURAS.has(clave)) { data = { ...LECTURAS.get(clave), modelo: "lectura reutilizada" }; }
     else for (let intento = 0; ; intento++) {
       let r;
-      try { r = await sb.functions.invoke(C.FUNCION_EXTRACCION, { body: { archivo: a.nombre, tipo, datos, esperados: a.esperados || null } }); }
+      try { r = await sb.functions.invoke(C.FUNCION_EXTRACCION, { body: { archivo: a.nombre, tipo, datos, esperados: a.esperados || null, pedido: a.id } }); }
       catch (e) { r = { error: { message: e?.message || String(e) } }; }
+      // la función devuelve el mismo identificador de la página: si no coincide, la respuesta no es de esta página y se descarta
+      if (!r.error && r.data?.pedido && r.data.pedido !== a.id) { console.error("Respuesta de otra página descartada", r.data.pedido, a.id); r = { error: { message: "Respuesta no corresponde a esta página" } }; }
       if (!r.error) { data = r.data; break; }
       let msg = r.error.message, status = r.error.context?.status, j = {};
       try { j = await r.error.context.json(); msg = j.error || msg; } catch {}
@@ -1427,7 +1434,7 @@ function convertirAEstadoDeCuenta(a) {
 function normalizarFactura(f, a, i, total) {
   const hora = /^\d{1,2}:\d{2}/.test(f.hora || "") ? f.hora.slice(0, 5).padStart(5, "0") : "";
   const out = {
-    id: uid(), archivoId: a.id, archivo: a.nombre + (total > 1 ? ` #${i + 1}` : ""), origen: a.origen || a.nombre, pagina: a.pagina || null, orden: i,
+    id: uid(), archivoId: a.id, origenId: a.origenId || null, archivo: a.nombre + (total > 1 ? ` #${i + 1}` : ""), origen: a.origen || a.nombre, pagina: a.pagina || null, orden: i,
     numero: f.numero ? String(f.numero).trim() : "", serie: f.serie || "", clave: f.clave_numerica ? String(f.clave_numerica).replace(/\D/g, "") : "",
     fecha: parseFecha(f.fecha_emision), hora, proveedor: f.proveedor_nombre || f.nombre_comercial || "",
     nombre_comercial: f.nombre_comercial && normTxt(f.nombre_comercial) !== normTxt(f.proveedor_nombre) ? String(f.nombre_comercial).trim() : "", nit: f.proveedor_identificacion || "", receptor: f.receptor_nombre || "",
@@ -2258,7 +2265,8 @@ function marcarFragmentos(facturas) {
   facturas.forEach(f => { delete f.fragmentoDe; });
   facturas.forEach(f => {
     if (f.editada || f.fecha || f.numero || f.clave || !f.pagina) return;
-    const previas = facturas.filter(p => p !== f && !p.fragmentoDe && p.origen === f.origen && p.pagina === f.pagina - 1)
+    const mismoArchivo = p => (p.origenId && f.origenId) ? p.origenId === f.origenId : p.origen === f.origen;
+    const previas = facturas.filter(p => p !== f && !p.fragmentoDe && mismoArchivo(p) && p.pagina === f.pagina - 1)
       .sort((a, b) => (b.orden ?? 0) - (a.orden ?? 0));
     // La unión queda fija la primera vez (f.unidoA), para que al volver a comparar no se separe
     const prev = (f.unidoA && previas.find(p => p.id === f.unidoA))
