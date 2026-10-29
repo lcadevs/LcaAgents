@@ -814,6 +814,12 @@ function matchNumero(f, valorExcel) {
   for (const c of cands) { const dC = soloDigitos(c), aC = alfanum(c); if ((aC && aC === aEx) || (dC && dC.length >= 3 && dC === dEx)) return "exacto"; }
   for (const c of cands) { const dC = soloDigitos(c); if (dC.length >= 4 && dEx.length >= 4 && (dC.endsWith(dEx) || dEx.endsWith(dC) || dC.includes(dEx))) return "parcial"; }
   for (const c of f.alternos || []) { const dC = soloDigitos(c), aC = alfanum(c); if ((aC && aC === aEx) || (dC.length >= 4 && dC === dEx)) return "alterno"; }
+  // Mismo número CONSECUTIVO final (últimos 8 dígitos, con al menos 4 significativos) aunque el inicio difiera:
+  // pasa cuando la lectura pierde o agrega un dígito en la sucursal/terminal (ej. 00100101-01-0000008245 vs 1000001010000008245)
+  for (const c of cands) {
+    const dC = soloDigitos(c);
+    if (dC.length >= 8 && dEx.length >= 8 && dC.slice(-8) === dEx.slice(-8) && dC.slice(-8).replace(/^0+/, "").length >= 4) return "consecutivo";
+  }
   return null;
 }
 const ALIAS_PAIS = { "usa": "estados unidos", "eeuu": "estados unidos", "ee uu": "estados unidos", "united states": "estados unidos", "us": "estados unidos",
@@ -1891,7 +1897,7 @@ function compararImporte(valor, monedaFact, l, campo) {
 function puntaje(f, l) {
   let s = 0;
   const num = matchNumero(f, l.numero);
-  if (num === "exacto") s += 50; else if (num === "parcial") s += 35; else if (num === "alterno") s += 28;
+  if (num === "exacto") s += 50; else if (num === "parcial") s += 35; else if (num === "consecutivo") s += 30; else if (num === "alterno") s += 28;
   if (!l.solo_propina) {
     const a = compararImporte(f.total, f.moneda, l, "monto");
     if (a.st === "ok") s += 25; else if (a.st === "warn") s += 15;
@@ -1924,11 +1930,43 @@ function avisoPropinaIncluida(f, l) {
     && compararImporte(f.propina, f.moneda, o, "monto").st === "ok"
     && (!o.fecha_gasto || !l.fecha_gasto || Math.abs(difDiasFirmado(o.fecha_gasto, l.fecha_gasto)) <= 1));
   return otra
-    ? { c: "Propina", st: "warn", propinaIncluida: true, nota: `incluida en el importe de esta línea (${monto}), y la línea ${otra.id_gasto ?? ""} (${otra.numero || "sin número"}) tiene el mismo monto: posible doble registro, verificar` }
+    ? { c: "Propina", st: "error", propinaIncluida: true, nota: `registrada dos veces: está incluida en el importe de esta línea (${monto}) y además la línea ${otra.id_gasto ?? ""} (${otra.numero || "sin número"}) tiene el mismo monto` }
     : { c: "Propina", st: "warn", propinaIncluida: true, nota: `incluida en el importe de esta línea (${monto}); debe registrarse aparte como línea -P` };
+}
+/**
+ * La IA a veces deja la propina o el cargo por servicio DENTRO del total (no la separa). Se detecta cuando:
+ *  A) SAP registró la propina aparte y total del comprobante = importe de la factura + propina de SAP, o
+ *  B) SAP no tiene propina y la diferencia es el 10 % de servicio (o la IA la menciona como servicio/propina).
+ * Devuelve la propina deducida (en la moneda del comprobante) o null.
+ */
+function propinaDentroDelTotal(f, l) {
+  if (!l || l.solo_propina || !(f.total > 0) || f.propina > 0) return null;
+  if (compararImporte(f.total, f.moneda, l, "monto").st === "ok") return null;
+  const mismaMon = !f.moneda || !l.moneda || f.moneda === l.moneda || (["USD", "PAB"].includes(f.moneda) && ["USD", "PAB"].includes(l.moneda));
+  if (l.propina > 0) {
+    const suma = { ...l, monto: (l.monto || 0) + l.propina, monto_local: (l.monto_local || 0) + (l.propina_local || 0) };
+    if (compararImporte(f.total, f.moneda, suma, "monto").st !== "ok") return null;
+    const prop = mismaMon ? l.propina : Math.round(f.total * l.propina / ((l.monto || 0) + l.propina) * 100) / 100;
+    return { propina: prop, motivo: "sap" };
+  }
+  if (!mismaMon || !(l.monto > 0) || f.total <= l.monto) return null;
+  const dif = Math.round((f.total - l.monto) * 100) / 100;
+  const esDiezPorCiento = Math.abs(dif - l.monto * 0.10) <= Math.max(0.02, l.monto * 0.005);
+  const laIaLoDice = /servicio|propina|tip|gratuity/i.test(f.observaciones || "") && (f.observaciones || "").replace(/,/g, ".").includes(dif.toFixed(2));
+  return esDiezPorCiento || laIaLoDice ? { propina: dif, motivo: "servicio" } : null;
 }
 function evaluarPar(f, l, num) {
   const campos = [], notas = [], g = G();
+  // propina o servicio que la lectura dejó dentro del total: se separa antes de comparar
+  const dentro = propinaDentroDelTotal(f, l);
+  if (dentro) {
+    const totalLeido = f.total;
+    f.propinaInferida = dentro.propina;
+    f = { ...f, total: Math.round((f.total - dentro.propina) * 100) / 100, propina: dentro.propina };
+    if (dentro.motivo === "sap")
+      campos.push({ c: "Propina en el total", st: "na", nota: `el total del comprobante (${mm(f.moneda || S.monedaLocal, totalLeido)}) incluye la propina o servicio de ${mm(f.moneda || S.monedaLocal, dentro.propina)}, que SAP registró aparte` });
+    else notas.push(`El total del comprobante (${mm(f.moneda || S.monedaLocal, totalLeido)}) incluye cargo por servicio o propina de ${mm(f.moneda || S.monedaLocal, dentro.propina)} (${Math.round(dentro.propina / (totalLeido - dentro.propina) * 100)} %); se comparó el consumo sin ese cargo.`);
+  }
   const m = f.moneda || S.monedaLocal;
   // Si el número no coincide pero monto y proveedor sí (ej. tiquetes sin número donde SAP usa fecha-hora), es advertencia
   const simP = simProveedor(f, l.proveedor), montoOk = compararImporte(f.total, f.moneda, l, "monto").st === "ok";
@@ -1939,8 +1977,9 @@ function evaluarPar(f, l, num) {
     campos.push({ c: "No. factura", st: "na", nota: `el comprobante no tiene ID fiscal; no se compara el número${fh ? ` · el ID de SAP (${l.numero}) ${fh}` : ` (SAP: ${l.numero})`}` });
   } else
   campos.push({ c: "No. factura",
-    st: num === "exacto" || num === "parcial" ? "ok" : num === "alterno" ? "warn" : (montoOk && simP >= 0.8) ? "warn" : "error",
+    st: num === "exacto" || num === "parcial" ? "ok" : num === "alterno" || num === "consecutivo" ? "warn" : (montoOk && simP >= 0.8) ? "warn" : "error",
     nota: num === "parcial" ? "coincide parcialmente" : num === "alterno" ? `SAP registró un número secundario del comprobante (tiquete/orden), no el número fiscal ${f.numero || ""}`.trim()
+      : num === "consecutivo" ? `coincide el consecutivo final (…${soloDigitos(l.numero).slice(-8)}) pero el resto difiere (${f.numero} vs ${l.numero}): verificar en el adjunto`
       : num ? "" : `número distinto (${f.numero || "sin número"} vs ${l.numero})${montoOk && simP >= 0.8 ? "; emparejado por monto y proveedor" : ""}` });
   // Total (sin propina)
   if (l.solo_propina) campos.push({ c: "Total", st: "error", nota: "En SAP solo se registró la propina, sin la línea de la factura" });
@@ -1967,7 +2006,20 @@ function evaluarPar(f, l, num) {
   const propinaEnTotal = campos.some(k => k.c === "Total" && k.propinaIncluida);
   if (propinaEnTotal && eP <= 0) campos.push(avisoPropinaIncluida(f, l));
   else if (eP > 0 && fP <= 0) campos.push({ c: "Propina", st: "error", nota: `Propina de ${money(eP)} registrada sin respaldo en la factura` });
-  else if (eP > 0) { const r = compararImporte(fP, f.moneda, l, "propina"); campos.push({ c: "Propina", st: r.st, nota: r.nota }); }
+  else if (eP > 0) {
+    let r = compararImporte(fP, f.moneda, l, "propina");
+    if (r.st !== "ok") {
+      // ¿la diferencia es el IVA de la propina? (ej. Nicaragua: servicio 10 % gravado con IVA 15 %)
+      const pct = infoPais(f.pais || S.paisEmpresa)?.iva_pct || 0;
+      if (pct > 0) {
+        if (compararImporte(fP / (1 + pct / 100), f.moneda, l, "propina").st === "ok")
+          r = { st: "ok", nota: `la propina del comprobante (${mm(m, fP)}) incluye IVA ${pct} %; SAP registró ${money(eP)} sin el IVA` };
+        else if (compararImporte(fP * (1 + pct / 100), f.moneda, l, "propina").st === "ok")
+          r = { st: "warn", nota: `la propina registrada en SAP (${money(eP)}) parece incluir IVA ${pct} % sobre ${mm(m, fP)} del comprobante; la propina se registra sin IVA` };
+      }
+    }
+    campos.push({ c: "Propina", st: r.st, nota: r.st === "ok" && !r.nota ? "respaldada por el comprobante" : r.nota });
+  }
   else if (fP > 0) campos.push({ c: "Propina", st: "na", nota: `La factura trae propina de ${mm(m, fP)} que no se reclamó` });
   if (eP > 0 && l.monto) {
     const pct = eP / l.monto * 100;
@@ -2136,7 +2188,8 @@ function filasVista(R, opciones = {}) {
     const camposFact = (x.campos || []).filter(c => !CAMPOS_PROPINA.includes(c.c));
     const camposProp = (x.campos || []).filter(c => CAMPOS_PROPINA.includes(c.c));
     if (!l || !l.solo_propina) {
-      const estado = x.tipo === "par" ? peor([...camposFact.map(c => c.st), ...(x.ajustes || [])]) : x.estado;
+      // si la propina tiene su propia fila, su resultado va en esa fila; si no, cuenta en la fila de la factura
+      const estado = x.tipo === "par" ? peor([...(propinas.length ? camposFact : (x.campos || [])).map(c => c.st), ...(x.ajustes || [])]) : x.estado;
       filas.push({ tipo: "principal", clave: "p:" + (l ? l.id : "f:" + x.factura?.id), x, id: l ? l.id_gasto : null, estado, campos: x.tipo === "par" && propinas.length ? camposFact : (x.campos || []), notas: x.notas || [] });
     }
     propinas.forEach(t => {
@@ -2180,7 +2233,7 @@ function tiempoDe(f) {
   return { t: "almuerzo", nota: "sin hora: se asumió almuerzo/cena" };
 }
 function netoFactura(f, incluye) {
-  const total = f.total || 0, notas = [];
+  const total = (f.total || 0) - (f.propinaInferida || 0), notas = [];
   if (incluye) return { neto: total + (f.propina || 0), notas };
   const { iva, est, pct } = ivaEstimado(f);
   if (est) notas.push(`IVA estimado al ${pct} %`);
@@ -2373,11 +2426,19 @@ function emparejarMovimientos(res, movs) {
 function propinasPorMonto(res) {
   const absorbidas = new Set(), tolF = G().tol_fecha_dias ?? 1;
   const sueltas = res.filter(x => x.tipo === "linea_sola" && !x.linea.solo_propina && !(x.linea.propinas || []).length);
-  const pares = res.filter(x => x.tipo === "par" && x.factura?.propina > 0 && !(x.linea.propina > 0));
+  // propina del comprobante: la leída, o la diferencia entre el total leído y el importe de la factura en SAP (misma moneda)
+  const propinaDe = p => {
+    const f = p.factura, l = p.linea;
+    if (f?.propina > 0) return f.propina;
+    const mismaMon = !f?.moneda || !l?.moneda || f.moneda === l.moneda;
+    return mismaMon && f?.total > (l?.monto || 0) ? Math.round((f.total - l.monto) * 100) / 100 : 0;
+  };
+  // no se toma como propina aparte si el importe de la factura en SAP YA incluye la propina (sería cobrarla dos veces)
+  const pares = res.filter(x => x.tipo === "par" && propinaDe(x) > 0 && !(x.linea.propina > 0) && !x.campos.some(k => k.propinaIncluida));
   const cand = [];
   sueltas.forEach(s => pares.forEach(p => {
     const l = s.linea, f = p.factura;
-    if (compararImporte(f.propina, f.moneda, l, "monto").st !== "ok") return;
+    if (compararImporte(propinaDe(p), f.moneda, l, "monto").st !== "ok") return;
     const fechaRef = p.linea.fecha_gasto || f.fecha;
     const d = l.fecha_gasto && fechaRef ? Math.abs(difDiasFirmado(l.fecha_gasto, fechaRef)) : null;
     if (d !== null && d > tolF) return;
@@ -2406,9 +2467,29 @@ function propinasPorMonto(res) {
   }
   return absorbidas;
 }
+/**
+ * El mismo comprobante adjuntado dos veces (misma página escaneada dos veces, o repetido en otro archivo) se cuenta una sola vez.
+ * Solo se considera repetido si coinciden el NÚMERO de comprobante, el MONTO y el PROVEEDOR; si alguno difiere,
+ * se deja como está (y la validación de duplicados lo advierte).
+ */
+function quitarRepetidos(facturas) {
+  const tolA = Math.min(0.01, G().tol_monto_abs ?? 0.01);
+  const unicas = [];
+  facturas.forEach(f => { delete f.repetidoDe; f.repeticiones = []; });
+  for (const f of facturas) {
+    const num = normNumDoc(f.numero || f.clave || "");
+    const g = num && unicas.find(u => normNumDoc(u.numero || u.clave || "") === num
+      && (u.moneda || "") === (f.moneda || "")
+      && Math.abs((u.total || 0) - (f.total || 0)) <= tolA && Math.abs((u.propina || 0) - (f.propina || 0)) <= tolA
+      && ((u.nit && f.nit && alfanum(u.nit) === alfanum(f.nit)) || (simProveedor(u, f.proveedor) ?? 0) >= 0.6 || (simProveedor(f, u.proveedor) ?? 0) >= 0.6));
+    if (g) { f.repetidoDe = g.id; g.repeticiones.push(f); }
+    else unicas.push(f);
+  }
+  return unicas;
+}
 function comparar() {
-  const lineas = S.lineas, facturas = marcarFragmentos(S.facturas);
-  facturas.forEach(f => { delete f._tipoGasto; delete f._nochesSap; delete f._fechaLinea; });
+  const lineas = S.lineas, facturas = quitarRepetidos(marcarFragmentos(S.facturas));
+  facturas.forEach(f => { delete f._tipoGasto; delete f._nochesSap; delete f._fechaLinea; delete f.propinaInferida; });
   const pares = [];
   facturas.forEach((f, i) => lineas.forEach((l, j) => { const p = puntaje(f, l); if (p.s >= 32) pares.push({ i, j, ...p }); }));
   pares.sort((a, b) => b.s - a.s);
@@ -2428,6 +2509,11 @@ function comparar() {
     .concat(f.visibilidad !== "completa" ? [`Comprobante no 100 % visible${f.no_visibles?.length ? " (no se ve: " + f.no_visibles.join(", ") + ")" : ""}: puede que no se haya podido emparejar por eso; corrige los datos en la tabla y vuelve a comparar.`] : [])
     .concat(f.observaciones ? ["IA: " + f.observaciones] : []) }); });
   lineas.forEach((l, j) => { if (!usadasL.has(j)) res.push({ tipo: "linea_sola", estado: "error", factura: null, linea: l, campos: [], notas: [l.solo_propina ? "Propina registrada en SAP sin la factura base ni comprobante." : "Línea de SAP sin comprobante de respaldo."] }); });
+  // Comprobantes repetidos en los archivos: se tomaron una sola vez (queda constancia en la fila)
+  res.forEach(x => {
+    const reps = x.factura?.repeticiones || [];
+    if (reps.length) x.campos.push({ c: "Repetido en los archivos", st: "na", nota: `el mismo comprobante (número, proveedor y monto) también está en ${reps.map(r => r.archivo).join("; ")}; se tomó una sola vez` });
+  });
   // Propinas identificadas por MONTO: una línea suelta cuyo importe es la propina de un comprobante ya emparejado
   // (SAP no deja repetir el ID de factura, así que la propina puede venir con cualquier número o sufijo)
   const absorbidas = propinasPorMonto(res);
