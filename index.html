@@ -2317,15 +2317,28 @@ function evaluarLimites(facturas) {
 function marcarFragmentos(facturas) {
   facturas.forEach(f => { delete f.fragmentoDe; });
   facturas.forEach(f => {
-    if (f.editada || f.fecha || f.numero || f.clave || !f.pagina) return;
+    if (f.editada || f.numero || f.clave || !f.pagina) return;
     const mismoArchivo = p => (p.origenId && f.origenId) ? p.origenId === f.origenId : p.origen === f.origen;
-    const previas = facturas.filter(p => p !== f && !p.fragmentoDe && mismoArchivo(p) && p.pagina === f.pagina - 1)
-      .sort((a, b) => (b.orden ?? 0) - (a.orden ?? 0));
-    // La unión queda fija la primera vez (f.unidoA), para que al volver a comparar no se separe
-    const prev = (f.unidoA && previas.find(p => p.id === f.unidoA))
-      || previas.find(p => (simNombre(p.proveedor, f.proveedor) ?? 0) >= 0.8)
+    const candidatas = facturas.filter(p => p !== f && !p.fragmentoDe && mismoArchivo(p) && p.pagina < f.pagina);
+    if (!candidatas.length) return;
+    const ultimaPag = Math.max(...candidatas.map(p => p.pagina));
+    const previas = candidatas.filter(p => p.pagina === ultimaPag).sort((a, b) => (b.orden ?? 0) - (a.orden ?? 0));
+    const mismoNombre = p => (simNombre(p.proveedor, f.proveedor) ?? 0) >= 0.8;
+    const sinProveedor = !String(f.proveedor || "").trim();
+    // Cola de un documento: sin número, con el mismo total que un comprobante anterior del mismo archivo
+    // (ej. página que solo trae "TOTAL A PAGAR 69.85" y "Generado 03:09 pm 27/10/2026")
+    const mismoTotal = p => p.total > 0 && f.total > 0 && Math.abs(p.total - f.total) <= 0.01 && (!p.moneda || !f.moneda || p.moneda === f.moneda);
+    const cola = (sinProveedor || f.esContinuacion) ? candidatas.filter(p => mismoTotal(p) && (sinProveedor || mismoNombre(p)))
+      .sort((a, b) => (b.pagina - a.pagina) || ((b.orden ?? 0) - (a.orden ?? 0)))[0] : null;
+    // Con fecha solo se une si la IA la marcó como continuación o es la cola de un comprobante (la fecha suele ser la de impresión)
+    if (f.fecha && !cola && !(f.esContinuacion && previas.length)) return;
+    const prev = (f.unidoA && candidatas.find(p => p.id === f.unidoA))
+      || cola
+      || previas.find(mismoNombre)
       // la IA marcó la página como continuación, o a la única de la página anterior le falta el monto (el total quedó aquí)
-      || (previas.length && (f.esContinuacion || (previas.length === 1 && !(previas[0].total > 0) && f.total > 0)) ? previas[0] : null);
+      || (previas.length && (f.esContinuacion || (previas.length === 1 && !(previas[0].total > 0) && f.total > 0)) ? previas[0] : null)
+      // sin proveedor, número ni fecha: no identifica un comprobante propio
+      || (sinProveedor && !f.fecha && previas.length === 1 ? previas[0] : null);
     if (prev) {
       f.fragmentoDe = prev.id; f.unidoA = prev.id;
       if (!prev.hora && f.hora) prev.hora = f.hora;
@@ -2333,6 +2346,8 @@ function marcarFragmentos(facturas) {
         ["total", "total_pagado", "propina", "impuesto", "otros_cargos"].forEach(k => { if (f[k] > 0 && !(prev[k] > 0)) prev[k] = f[k]; });
         if (!prev.moneda && f.moneda) prev.moneda = f.moneda;
         prev.observaciones = [prev.observaciones, `Monto tomado de la página ${f.pagina} (continuación)`].filter(Boolean).join(" · ");
+      } else if (prev === cola && !String(prev.observaciones || "").includes(`página ${f.pagina} es continuación`)) {
+        prev.observaciones = [prev.observaciones, `La página ${f.pagina} es continuación de este comprobante (mismo total)`].filter(Boolean).join(" · ");
       }
     }
   });
