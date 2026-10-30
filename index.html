@@ -219,6 +219,10 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .btn-reinicio:hover{background:var(--primario);border-color:var(--primario)}
 .topbar .usuario{margin-left:auto;display:flex;align-items:center;gap:10px;color:#C9CDD2;font-size:13px}
 .shell{display:flex;min-height:calc(100vh - 52px)}
+#mExterno iframe{display:block;width:100%;height:calc(100vh - 52px);border:0;background:#fff}
+#mExterno .cargando{padding:40px;text-align:center}
+.mod-html{display:flex;flex-direction:column;gap:6px;min-width:190px}
+.mod-html .acc{display:flex;gap:6px;flex-wrap:wrap}
 .side{width:244px;flex:none;background:var(--side);color:var(--side-txt);position:sticky;top:52px;height:calc(100vh - 52px);overflow-y:auto;overflow-x:hidden;transition:width .18s ease;padding:10px 0}
 .side a{display:flex;align-items:center;gap:12px;padding:9px 16px 9px 18px;margin:1px 8px;border-radius:7px;color:var(--side-txt);text-decoration:none;font-size:13.5px;white-space:nowrap;position:relative}
 .side a:hover{background:var(--side-2);color:#fff}
@@ -629,14 +633,19 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
 <section id="aModulos" class="oculto">
   <div class="tarjeta">
     <h2>Módulos de la plataforma</h2>
-    <p class="sub">Cada agente es un módulo. Un módulo desactivado desaparece para todos (también para su IA y sus datos). Un módulo nuevo se muestra "en construcción" hasta que su pantalla se agregue al <code>index.html</code>.</p>
+    <p class="sub">Cada agente es un módulo. Un módulo desactivado desaparece para todos (también para su IA y sus datos). Para publicar o actualizar la pantalla de un módulo, sube su <b>index.html</b> (un solo archivo con todo adentro). Cada versión queda guardada y se puede restaurar. Luego asígnalo a los usuarios en <b>Usuarios y accesos → Editar módulos</b>.</p>
     <div class="scroll" style="max-height:none"><table id="tModulos"></table></div>
-    <h3>Agregar módulo</h3>
+    <input type="file" id="fileModHtml" accept=".html,.htm,text/html" class="oculto">
+    <div id="modVersiones"></div>
+    <h3>Nuevo módulo</h3>
     <div class="fila">
-      <div class="campo" style="max-width:200px"><label>Clave (minúsculas, sin espacios)</label><input type="text" id="nmClave" placeholder="ej. conciliacion_bancaria" maxlength="40"></div>
       <div class="campo" style="max-width:260px"><label>Nombre</label><input type="text" id="nmNombre" placeholder="ej. Conciliación bancaria" maxlength="80"></div>
+      <div class="campo" style="max-width:200px"><label>Clave (se arma sola)</label><input type="text" id="nmClave" placeholder="ej. conciliacion_bancaria" maxlength="40"></div>
       <div class="campo"><label>Descripción</label><input type="text" id="nmDesc" maxlength="240"></div>
-      <button class="btn primario" id="bNuevoModulo">Agregar</button>
+    </div>
+    <div class="fila" style="align-items:flex-end">
+      <div class="campo"><label>Pantalla del módulo (index.html) — opcional, se puede subir después</label><input type="file" id="nmHtml" accept=".html,.htm,text/html"></div>
+      <button class="btn primario" id="bNuevoModulo">Crear módulo</button>
     </div>
   </div>
 </section>
@@ -649,6 +658,12 @@ details summary{cursor:pointer;color:var(--tinta-2);font-weight:600;font-size:13
 </section>
 </main>
 </div><!-- /mAdmin -->
+
+<!-- ======================= MÓDULO CON PANTALLA SUBIDA (index.html propio) ======================= -->
+<div id="mExterno" class="modulo oculto">
+  <div id="extCargando" class="cargando muted oculto">Cargando módulo…</div>
+  <iframe id="ifModulo" title="Módulo" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-modals"></iframe>
+</div>
 
 <!-- ======================= MÓDULO EN CONSTRUCCIÓN ======================= -->
 <div id="mProx" class="modulo oculto">
@@ -887,7 +902,7 @@ async function mostrarSesion(session) {
   const nombre = session.user.user_metadata?.nombre;
   $("#uEmail").textContent = nombre ? `${nombre} · ${session.user.email}` : session.user.email;
   sesionUid = session.user.id;
-  S.usuario = nombre || session.user.email;
+  S.usuario = nombre || session.user.email; S.correo = session.user.email;
   $("#saludo").textContent = `Hola, ${(nombre || session.user.email).split(/[ @]/)[0]}`;
   if (sesionCargada === sesionUid) return;
   sesionCargada = sesionUid;
@@ -2861,8 +2876,18 @@ const svgIco = k => `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><pa
 const MODULOS_APP = {
   [MOD_REVISOR]: { el: "#mRevisor", alAbrir: () => { cargarCapacidad(); calentarFuncion(); } },
 };
-const PL = { modulos: [], permitidos: new Set(), instalada: true, asignaciones: [] };
+const PL = { modulos: [], permitidos: new Set(), instalada: true, asignaciones: [], conHtml: new Map(), htmlCache: new Map() };
 const puedeUsar = clave => PL.permitidos.has(clave);
+/** ¿El módulo tiene pantalla? (incluida en este archivo o subida por un administrador) */
+const tienePantalla = clave => !!MODULOS_APP[clave] || PL.conHtml.has(clave);
+/** Datos de las pantallas subidas que el usuario puede ver (la base de datos solo devuelve las de sus módulos) */
+async function cargarPantallas() {
+  PL.conHtml = new Map();
+  try {
+    const { data, error } = await sb.from("modulos_html").select("clave,version,nombre_archivo,tamano,actualizado_por,actualizado_en");
+    if (!error) (data || []).forEach(r => PL.conHtml.set(r.clave, r));
+  } catch {}   // la tabla aún no existe: los módulos sin pantalla quedan "en construcción"
+}
 
 async function cargarPlataforma() {
   const { data: mods, error } = await sb.from("modulos").select("*").order("orden").order("nombre");
@@ -2874,6 +2899,7 @@ async function cargarPlataforma() {
   } else {
     PL.instalada = true;
     PL.modulos = mods || [];
+    await cargarPantallas();
     if (S.esAdmin) PL.permitidos = new Set(PL.modulos.filter(m => m.activo).map(m => m.clave));
     else {
       const { data: um } = await sb.from("usuario_modulos").select("modulo").eq("user_id", sesionUid);
@@ -2893,7 +2919,7 @@ function dibujarMenu() {
 function dibujarInicio() {
   const mods = PL.modulos.filter(m => PL.permitidos.has(m.clave));
   $("#tilesInicio").innerHTML = mods.length ? mods.map(m => {
-    const listo = !!MODULOS_APP[m.clave];
+    const listo = tienePantalla(m.clave);
     return `<a class="tile${listo ? "" : " prox"}" href="#/${m.clave}"><div class="t-ico">${svgIco(m.icono)}</div><b>${esc(m.nombre)}</b><p>${esc(m.descripcion || "")}</p><span class="ir">${listo ? "Abrir →" : "En construcción"}</span></a>`;
   }).join("") + (S.esAdmin && PL.instalada ? `<a class="tile" href="#/admin"><div class="t-ico">${svgIco("admin")}</div><b>Administración</b><p>Usuarios, módulos asignados e historial de accesos.</p><span class="ir">Abrir →</span></a>` : "")
     : `<div class="tarjeta vacio" style="grid-column:1/-1"><div class="vacio-ico">${svgIco("modulo")}</div><h2 style="justify-content:center">Aún no tienes módulos asignados</h2><p class="sub">Pide a un administrador de la plataforma que te asigne los módulos que necesitas.</p></div>`;
@@ -2909,7 +2935,9 @@ function navegar() {
   }
   if (ruta === "admin" && !(S.esAdmin && PL.instalada)) { ruta = "inicio"; history.replaceState(null, "", "#/inicio"); }
   const mod = PL.modulos.find(m => m.clave === ruta);
-  const el = ruta === "inicio" ? "#mInicio" : ruta === "admin" ? "#mAdmin" : (MODULOS_APP[ruta]?.el || "#mProx");
+  const el = ruta === "inicio" ? "#mInicio" : ruta === "admin" ? "#mAdmin" : (MODULOS_APP[ruta]?.el || (PL.conHtml.has(ruta) ? "#mExterno" : "#mProx"));
+  if (el !== "#mExterno" && PL.externoAbierto) { $("#ifModulo").srcdoc = ""; PL.externoAbierto = null; }   // al salir se descarga la pantalla
+  if (el === "#mExterno") abrirModuloExterno(ruta);
   $$(".modulo").forEach(m => m.classList.toggle("oculto", "#" + m.id !== el));
   if (el === "#mProx") { $("#proxNombre").textContent = mod?.nombre || ruta; $("#proxDesc").textContent = mod?.descripcion || ""; }
   $$("#sideNav a").forEach(a => a.classList.toggle("activo", a.dataset.ruta === ruta));
@@ -3029,19 +3057,23 @@ async function cargarModulosAdmin() {
   const t = $("#tModulos");
   const { data: mods, error } = await sb.from("modulos").select("*").order("orden").order("nombre");
   if (error) { t.innerHTML = `<tbody><tr><td><div class="aviso error">${esc(error.message)}</div></td></tr></tbody>`; return; }
-  await cargarAsignaciones();
+  await Promise.all([cargarAsignaciones(), cargarPantallas()]);
   const cuenta = c => PL.asignaciones.filter(a => a.modulo === c).length;
   const opIco = Object.keys(ICONOS).filter(k => !["inicio", "admin"].includes(k));
-  t.innerHTML = `<thead><tr><th></th><th>Clave</th><th>Nombre</th><th>Descripción</th><th>Icono</th><th class="num">Orden</th><th class="num">Usuarios</th><th>Estado</th></tr></thead><tbody>` +
+  t.innerHTML = `<thead><tr><th></th><th>Clave</th><th>Nombre</th><th>Descripción</th><th>Icono</th><th class="num">Orden</th><th class="num">Usuarios</th><th>Pantalla</th><th>Estado</th></tr></thead><tbody>` +
     mods.map(m => `<tr data-mod="${esc(m.clave)}">
       <td style="color:var(--primario)">${svgIco(m.icono)}</td>
-      <td class="mini"><code>${esc(m.clave)}</code>${MODULOS_APP[m.clave] ? "" : '<div class="chip na" style="margin-top:4px">en construcción</div>'}</td>
+      <td class="mini"><code>${esc(m.clave)}</code>${tienePantalla(m.clave) ? "" : '<div class="chip na" style="margin-top:4px">en construcción</div>'}</td>
       <td><input type="text" data-c="nombre" value="${esc(m.nombre)}" maxlength="80"></td>
       <td><input type="text" data-c="descripcion" value="${esc(m.descripcion || "")}" maxlength="240"></td>
       <td><select data-c="icono">${opIco.map(k => `<option ${m.icono === k ? "selected" : ""}>${k}</option>`).join("")}</select></td>
       <td class="num"><input type="number" data-c="orden" value="${m.orden}" style="width:70px"></td>
       <td class="num">${cuenta(m.clave)}</td>
+      <td>${celdaPantalla(m)}</td>
       <td><label class="check"><input type="checkbox" data-c="activo" ${m.activo ? "checked" : ""}> Activo</label></td></tr>`).join("") + "</tbody>";
+  $$("[data-subir]", t).forEach(b => b.addEventListener("click", () => { PL.subirA = b.dataset.subir; $("#fileModHtml").value = ""; $("#fileModHtml").click(); }));
+  $$("[data-versiones]", t).forEach(b => b.addEventListener("click", () => verVersiones(b.dataset.versiones)));
+  $$("[data-quitarhtml]", t).forEach(b => b.addEventListener("click", () => quitarPantalla(b.dataset.quitarhtml)));
   $$("[data-c]", t).forEach(inp => inp.addEventListener("change", async () => {
     const clave = inp.closest("tr").dataset.mod, campo = inp.dataset.c;
     const valor = campo === "activo" ? inp.checked : campo === "orden" ? parseInt(inp.value, 10) || 100 : inp.value.trim();
@@ -3051,16 +3083,116 @@ async function cargarModulosAdmin() {
     if (!e) cargarPlataforma();
   }));
 }
+/** Clave a partir del nombre: "Conciliación bancaria" → conciliacion_bancaria */
+const claveDeNombre = n => normTxt(n).replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40);
+$("#nmNombre").addEventListener("input", () => { if (!$("#nmClave").dataset.manual) $("#nmClave").value = claveDeNombre($("#nmNombre").value); });
+$("#nmClave").addEventListener("input", () => { $("#nmClave").dataset.manual = $("#nmClave").value ? "1" : ""; });
 $("#bNuevoModulo").addEventListener("click", async () => {
-  const clave = $("#nmClave").value.trim().toLowerCase(), nombre = $("#nmNombre").value.trim();
-  if (!/^[a-z0-9_]{3,40}$/.test(clave)) return toast("La clave debe tener de 3 a 40 letras minúsculas, números o guion bajo.");
+  const nombre = $("#nmNombre").value.trim(), clave = ($("#nmClave").value.trim() || claveDeNombre(nombre)).toLowerCase();
   if (!nombre) return toast("Escribe el nombre del módulo.");
-  const { error } = await sb.from("modulos").insert({ clave, nombre, descripcion: $("#nmDesc").value.trim() || null, icono: "modulo", orden: 100 });
-  if (error) return toast("No se pudo agregar: " + error.message, 6000);
-  ["#nmClave", "#nmNombre", "#nmDesc"].forEach(s => $(s).value = "");
-  toast("Módulo agregado. Asígnalo a los usuarios en Usuarios y accesos.");
+  if (!/^[a-z0-9_]{3,40}$/.test(clave)) return toast("La clave debe tener de 3 a 40 letras minúsculas, números o guion bajo.");
+  const archivo = $("#nmHtml").files[0];
+  let html = null;
+  if (archivo) { try { html = await leerHtmlModulo(archivo); } catch (e) { return toast(e.message, 6000); } }
+  const b = $("#bNuevoModulo"); b.disabled = true;
+  try {
+    const { error } = await sb.from("modulos").insert({ clave, nombre, descripcion: $("#nmDesc").value.trim() || null, icono: "modulo", orden: 100 });
+    if (error) return toast("No se pudo crear: " + (/duplicate|unique/i.test(error.message) ? `ya existe un módulo con la clave "${clave}"` : error.message), 6000);
+    if (html) {
+      const { error: e2 } = await sb.from("modulos_html").insert({ clave, html, nombre_archivo: archivo.name });
+      if (e2) toast("El módulo se creó, pero no se pudo subir la pantalla: " + e2.message + ". Súbela desde la tabla.", 8000);
+    }
+    ["#nmClave", "#nmNombre", "#nmDesc", "#nmHtml"].forEach(sel => $(sel).value = ""); $("#nmClave").dataset.manual = "";
+    toast(html ? "Módulo creado con su pantalla. Asígnalo a los usuarios en Usuarios y accesos." : "Módulo creado. Sube su index.html desde la tabla y asígnalo a los usuarios.", 6000);
+    await cargarPlataforma(); cargarModulosAdmin();
+  } finally { b.disabled = false; }
+});
+
+/* ---------- Pantallas subidas (index.html de cada módulo) ---------- */
+const MAX_MB_HTML_MODULO = 10;
+const kb = n => n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB";
+const fechaCorta = f => new Date(f).toLocaleString("es-CR", { dateStyle: "short", timeStyle: "short" });
+async function leerHtmlModulo(archivo) {
+  if (!/\.html?$/i.test(archivo.name)) throw new Error("Sube un archivo .html (el index.html del módulo).");
+  if (archivo.size > MAX_MB_HTML_MODULO * 1048576) throw new Error(`El archivo pesa ${kb(archivo.size)}; el máximo es ${MAX_MB_HTML_MODULO} MB.`);
+  const html = await archivo.text();
+  if (!/<(html|body|head|div|script|main|!doctype)/i.test(html)) throw new Error("El archivo no parece una página HTML.");
+  return html;
+}
+function celdaPantalla(m) {
+  if (MODULOS_APP[m.clave]) return '<span class="chip ok">Incluida en la plataforma</span>';
+  const h = PL.conHtml.get(m.clave);
+  return `<div class="mod-html">${h ? `<span class="mini"><span class="chip ok">v${h.version}</span> ${esc(h.nombre_archivo || "index.html")} · ${kb(h.tamano || 0)}<br><span class="muted">${esc(h.actualizado_por || "")} · ${fechaCorta(h.actualizado_en)}</span></span>` : '<span class="chip na">Sin pantalla</span>'}
+    <div class="acc"><button class="btn chico ${h ? "" : "primario"}" data-subir="${esc(m.clave)}">${h ? "Reemplazar HTML" : "Subir HTML"}</button>${h ? `<button class="btn chico" data-versiones="${esc(m.clave)}">Versiones</button><button class="btn chico" data-quitarhtml="${esc(m.clave)}">Quitar</button>` : ""}</div></div>`;
+}
+$("#fileModHtml").addEventListener("change", async e => {
+  const archivo = e.target.files[0], clave = PL.subirA;
+  if (!archivo || !clave) return;
+  let html;
+  try { html = await leerHtmlModulo(archivo); } catch (err) { return toast(err.message, 6000); }
+  const nombre = PL.modulos.find(m => m.clave === clave)?.nombre || clave;
+  if (PL.conHtml.has(clave) && !confirm(`¿Reemplazar la pantalla de "${nombre}" por ${archivo.name}? Los usuarios verán la nueva versión al abrir el módulo. La anterior queda en Versiones.`)) return;
+  toast("Subiendo…");
+  const { error } = await sb.from("modulos_html").upsert({ clave, html, nombre_archivo: archivo.name }, { onConflict: "clave" });
+  if (error) return toast("No se pudo subir: " + error.message, 8000);
+  PL.htmlCache.delete(clave);
+  toast(`Pantalla de "${nombre}" actualizada.`);
   await cargarPlataforma(); cargarModulosAdmin();
 });
+async function quitarPantalla(clave) {
+  const nombre = PL.modulos.find(m => m.clave === clave)?.nombre || clave;
+  if (!confirm(`¿Quitar la pantalla de "${nombre}"? El módulo quedará "en construcción" hasta que subas otra. Las versiones anteriores se conservan.`)) return;
+  const { error } = await sb.from("modulos_html").delete().eq("clave", clave);
+  if (error) return toast("No se pudo quitar: " + error.message, 6000);
+  PL.htmlCache.delete(clave); toast("Pantalla quitada.");
+  await cargarPlataforma(); cargarModulosAdmin();
+}
+async function verVersiones(clave) {
+  const cont = $("#modVersiones"), nombre = PL.modulos.find(m => m.clave === clave)?.nombre || clave, actual = PL.conHtml.get(clave)?.version;
+  cont.innerHTML = `<div class="tarjeta" style="margin-top:14px"><p class="muted">Cargando versiones…</p></div>`;
+  const { data, error } = await sb.from("modulos_html_historial").select("id,version,nombre_archivo,tamano,subido_por,subido_en").eq("clave", clave).order("version", { ascending: false });
+  if (error) { cont.innerHTML = `<div class="aviso error">${esc(error.message)}</div>`; return; }
+  cont.innerHTML = `<div class="tarjeta" style="margin-top:14px"><div class="fila" style="justify-content:space-between;align-items:center"><h3 style="margin:0">Versiones de "${esc(nombre)}"</h3><button class="btn chico" id="bCerrarVers">Cerrar</button></div>
+    <p class="sub">Se guardan las últimas 20. Restaurar crea una versión nueva con el contenido de la elegida.</p>
+    <div class="scroll" style="max-height:none"><table><thead><tr><th>Versión</th><th>Archivo</th><th class="num">Tamaño</th><th>Subida por</th><th>Fecha</th><th></th></tr></thead><tbody>${(data || []).map(v => `<tr>
+      <td><b>v${v.version}</b>${v.version === actual ? ' <span class="chip ok">en uso</span>' : ""}</td><td class="mini">${esc(v.nombre_archivo || "")}</td><td class="num mini">${kb(v.tamano || 0)}</td>
+      <td class="mini">${esc(v.subido_por || "")}</td><td class="mini">${fechaCorta(v.subido_en)}</td>
+      <td><div class="acc fila" style="gap:6px"><button class="btn chico" data-descargar="${v.id}">Descargar</button>${v.version === actual ? "" : `<button class="btn chico" data-restaurar-v="${v.id}">Restaurar</button>`}</div></td></tr>`).join("") || '<tr><td colspan="6" class="muted">Sin versiones.</td></tr>'}</tbody></table></div></div>`;
+  $("#bCerrarVers").addEventListener("click", () => cont.innerHTML = "");
+  const traer = async id => { const { data: r, error: e } = await sb.from("modulos_html_historial").select("html,nombre_archivo,version").eq("id", id).single(); if (e) throw e; return r; };
+  $$("[data-descargar]", cont).forEach(b => b.addEventListener("click", async () => {
+    try { const r = await traer(b.dataset.descargar); const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([r.html], { type: "text/html" })); a.download = r.nombre_archivo || `${clave}_v${r.version}.html`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000); }
+    catch (e) { toast("No se pudo descargar: " + e.message); }
+  }));
+  $$("[data-restaurar-v]", cont).forEach(b => b.addEventListener("click", async () => {
+    try {
+      const r = await traer(b.dataset.restaurarV);
+      if (!confirm(`¿Volver a la versión v${r.version} de "${nombre}"? Los usuarios la verán al abrir el módulo.`)) return;
+      const { error: e } = await sb.from("modulos_html").upsert({ clave, html: r.html, nombre_archivo: r.nombre_archivo }, { onConflict: "clave" });
+      if (e) throw e;
+      PL.htmlCache.delete(clave); toast(`Se restauró la versión v${r.version}.`);
+      await cargarPlataforma(); await cargarModulosAdmin(); verVersiones(clave);
+    } catch (e) { toast("No se pudo restaurar: " + e.message, 6000); }
+  }));
+}
+/** Abre la pantalla subida en un marco aislado: no puede leer la sesión ni los datos de la plataforma */
+async function abrirModuloExterno(clave) {
+  const meta = PL.conHtml.get(clave);
+  if (!meta || PL.externoAbierto === clave + "#" + meta.version) return;
+  PL.externoAbierto = clave + "#" + meta.version;
+  const ifr = $("#ifModulo"); $("#extCargando").classList.remove("oculto"); ifr.classList.add("oculto");
+  let html = PL.htmlCache.get(clave);
+  if (!html || html.version !== meta.version) {
+    const { data, error } = await sb.from("modulos_html").select("html,version").eq("clave", clave).maybeSingle();
+    if (error || !data) { $("#extCargando").innerHTML = `<div class="aviso error">No se pudo cargar el módulo${error ? ": " + esc(error.message) : ""}.</div>`; PL.externoAbierto = null; return; }
+    html = data; PL.htmlCache.set(clave, html);
+  }
+  if (PL.externoAbierto !== clave + "#" + meta.version) return;   // el usuario ya cambió de módulo
+  ifr.onload = () => { try { ifr.contentWindow.postMessage({ tipo: "lca:usuario", nombre: S.usuario, correo: S.correo, modulo: clave }, "*"); } catch {} };
+  ifr.title = PL.modulos.find(m => m.clave === clave)?.nombre || "Módulo";
+  ifr.srcdoc = html.html;
+  $("#extCargando").classList.add("oculto"); $("#extCargando").textContent = "Cargando módulo…"; ifr.classList.remove("oculto");
+}
 async function cargarBitacora() {
   const t = $("#tBitacora");
   t.innerHTML = `<tbody><tr><td class="muted">Cargando…</td></tr></tbody>`;
