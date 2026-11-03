@@ -891,6 +891,7 @@ async function iniciar() {
   sb.auth.onAuthStateChange((evt, session) => {
     if (evt === "PASSWORD_RECOVERY") { setTimeout(cambiarClave, 0); return; }
     if (evt === "SIGNED_IN" || evt === "INITIAL_SESSION" || evt === "SIGNED_OUT") setTimeout(() => mostrarSesion(session), 0);
+    if (evt === "TOKEN_REFRESHED" && PL.externoAbierto) setTimeout(() => enviarSesionModulo(false), 0);   // el módulo abierto recibe la sesión renovada
   });
 }
 async function mostrarSesion(session) {
@@ -3060,7 +3061,7 @@ async function cargarModulosAdmin() {
   await Promise.all([cargarAsignaciones(), cargarPantallas()]);
   const cuenta = c => PL.asignaciones.filter(a => a.modulo === c).length;
   const opIco = Object.keys(ICONOS).filter(k => !["inicio", "admin"].includes(k));
-  t.innerHTML = `<thead><tr><th></th><th>Clave</th><th>Nombre</th><th>Descripción</th><th>Icono</th><th class="num">Orden</th><th class="num">Usuarios</th><th>Pantalla</th><th>Estado</th></tr></thead><tbody>` +
+  t.innerHTML = `<thead><tr><th></th><th>Clave</th><th>Nombre</th><th>Descripción</th><th>Icono</th><th class="num">Orden</th><th class="num">Usuarios</th><th>Pantalla</th><th title="El módulo puede leer y guardar sus datos con la sesión del usuario que lo abre">Usa datos</th><th>Estado</th></tr></thead><tbody>` +
     mods.map(m => `<tr data-mod="${esc(m.clave)}">
       <td style="color:var(--primario)">${svgIco(m.icono)}</td>
       <td class="mini"><code>${esc(m.clave)}</code>${tienePantalla(m.clave) ? "" : '<div class="chip na" style="margin-top:4px">en construcción</div>'}</td>
@@ -3070,13 +3071,15 @@ async function cargarModulosAdmin() {
       <td class="num"><input type="number" data-c="orden" value="${m.orden}" style="width:70px"></td>
       <td class="num">${cuenta(m.clave)}</td>
       <td>${celdaPantalla(m)}</td>
+      <td>${MODULOS_APP[m.clave] ? '<span class="muted mini">—</span>' : `<label class="check"><input type="checkbox" data-c="usa_datos" ${m.usa_datos ? "checked" : ""}> Sí</label>`}</td>
       <td><label class="check"><input type="checkbox" data-c="activo" ${m.activo ? "checked" : ""}> Activo</label></td></tr>`).join("") + "</tbody>";
   $$("[data-subir]", t).forEach(b => b.addEventListener("click", () => { PL.subirA = b.dataset.subir; $("#fileModHtml").value = ""; $("#fileModHtml").click(); }));
   $$("[data-versiones]", t).forEach(b => b.addEventListener("click", () => verVersiones(b.dataset.versiones)));
   $$("[data-quitarhtml]", t).forEach(b => b.addEventListener("click", () => quitarPantalla(b.dataset.quitarhtml)));
   $$("[data-c]", t).forEach(inp => inp.addEventListener("change", async () => {
     const clave = inp.closest("tr").dataset.mod, campo = inp.dataset.c;
-    const valor = campo === "activo" ? inp.checked : campo === "orden" ? parseInt(inp.value, 10) || 100 : inp.value.trim();
+    const valor = inp.type === "checkbox" ? inp.checked : campo === "orden" ? parseInt(inp.value, 10) || 100 : inp.value.trim();
+    if (campo === "usa_datos" && valor && !confirm("El módulo podrá leer y guardar datos en Supabase con los permisos del usuario que lo abra (nunca más que esos permisos). Actívalo solo para módulos de confianza. ¿Continuar?")) { inp.checked = false; return; }
     if (campo === "activo" && !valor && !confirm("Al desactivar el módulo, nadie (salvo administradores) podrá usarlo ni ver sus datos. ¿Continuar?")) { inp.checked = true; return; }
     const { error: e } = await sb.from("modulos").update({ [campo]: valor }).eq("clave", clave);
     toast(e ? "No se pudo guardar: " + e.message : "Módulo actualizado.");
@@ -3175,7 +3178,33 @@ async function verVersiones(clave) {
     } catch (e) { toast("No se pudo restaurar: " + e.message, 6000); }
   }));
 }
-/** Abre la pantalla subida en un marco aislado: no puede leer la sesión ni los datos de la plataforma */
+/** Puente con el módulo abierto. Todos reciben quién es el usuario; los módulos con "Usa datos" reciben además
+ *  la sesión (token de acceso de corta duración, sin el de renovación) para trabajar con sus propios datos bajo RLS. */
+async function enviarSesionModulo(renovar) {
+  const ifr = $("#ifModulo"), clave = (PL.externoAbierto || "").split("#")[0];
+  if (!clave || !ifr.contentWindow) return;
+  const mod = PL.modulos.find(m => m.clave === clave) || {};
+  const usuario = { id: sesionUid, nombre: S.usuario, correo: S.correo, admin: !!S.esAdmin };
+  const msg = { tipo: "lca:usuario", nombre: S.usuario, correo: S.correo, modulo: clave, usuario };
+  if (mod.usa_datos) {
+    try {
+      let { data: { session } } = await sb.auth.getSession();
+      if (session && (renovar || session.expires_at * 1000 - Date.now() < 120000)) ({ data: { session } } = await sb.auth.refreshSession());
+      if (session) Object.assign(msg, { tipo: "lca:sesion", url: C.SUPABASE_URL, key: C.SUPABASE_ANON_KEY, token: session.access_token, expira: session.expires_at });
+    } catch {}
+  }
+  if ((PL.externoAbierto || "").split("#")[0] !== clave) return;
+  try { ifr.contentWindow.postMessage(msg, "*"); } catch {}
+}
+window.addEventListener("message", e => {
+  const ifr = $("#ifModulo");
+  if (!ifr || e.source !== ifr.contentWindow || !PL.externoAbierto) return;   // solo el módulo abierto
+  const t = e.data && e.data.tipo;
+  if (t === "lca:hola") enviarSesionModulo(false);
+  else if (t === "lca:renovar") enviarSesionModulo(true);
+  else if (t === "lca:aviso" && typeof e.data.texto === "string") toast(e.data.texto.slice(0, 200));
+});
+/** Abre la pantalla subida en un marco aislado: no puede leer la sesión ni los datos de la plataforma por su cuenta */
 async function abrirModuloExterno(clave) {
   const meta = PL.conHtml.get(clave);
   if (!meta || PL.externoAbierto === clave + "#" + meta.version) return;
@@ -3188,7 +3217,7 @@ async function abrirModuloExterno(clave) {
     html = data; PL.htmlCache.set(clave, html);
   }
   if (PL.externoAbierto !== clave + "#" + meta.version) return;   // el usuario ya cambió de módulo
-  ifr.onload = () => { try { ifr.contentWindow.postMessage({ tipo: "lca:usuario", nombre: S.usuario, correo: S.correo, modulo: clave }, "*"); } catch {} };
+  ifr.onload = () => enviarSesionModulo(false);
   ifr.title = PL.modulos.find(m => m.clave === clave)?.nombre || "Módulo";
   ifr.srcdoc = html.html;
   $("#extCargando").classList.add("oculto"); $("#extCargando").textContent = "Cargando módulo…"; ifr.classList.remove("oculto");
